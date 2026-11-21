@@ -1,0 +1,14 @@
+# RoadRunner config baked into the image as /var/www/html/.rr.yaml (see the
+# Dockerfile). `artisan octane:roadrunner` passes its own -o overrides for the
+# address, worker pool, RPC, logging and middleware; this file only adds what
+# those overrides leave out.
+version: '3'
+http:
+  # Upload ceiling for the app itself; nginx and Cloudflare cap below this.
+  max_request_size: 400
+  static:
+    dir: "public"
+    # Never hand out PHP sources or server config as static files
+    # (public/index.php, public/installer.php, .htaccess). Forbidden files
+    # fall through to Laravel, which answers 404.
+    forbid: [ ".php", ".htaccess" ]

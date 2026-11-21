@@ -1,0 +1,89 @@
+<?php
+
+namespace App\Filament\Staff\Resources\MarketAnalyses;
+
+use Filament\Schemas\Schema;
+use Filament\Forms\Components\DatePicker;
+use Filament\Forms\Components\Select;
+use Filament\Tables\Columns\TextColumn;
+use Filament\Actions\ViewAction;
+use Filament\Actions\BulkActionGroup;
+use Filament\Actions\DeleteBulkAction;
+use App\Filament\Staff\Resources\MarketAnalyses\Pages\ListMarketAnalyses;
+use App\Filament\Staff\Resources\MarketAnalyses\Pages\CreateMarketAnalysis;
+use App\Filament\Staff\Resources\MarketAnalyses\Pages\ViewMarketAnalysis;
+use App\Filament\Staff\Resources\MarketAnalysisResource\Pages;
+use App\Models\Property;
+use Filament\Forms;
+use Filament\Resources\Resource;
+use Filament\Tables;
+use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Builder;
+
+class MarketAnalysisResource extends Resource
+{
+    protected static ?string $model = Property::class;
+
+    public static function getModelLabel(): string
+    {
+        return app()->getLocale() === 'ar' ? 'تحليل السوق' : 'Market Analysis';
+    }
+
+    public static function getPluralModelLabel(): string
+    {
+        return app()->getLocale() === 'ar' ? 'تحليلات السوق' : 'Market Analyses';
+    }
+
+    protected static string | \BackedEnum | null $navigationIcon = 'heroicon-o-chart-bar';
+
+    public static function form(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                DatePicker::make('start_date')
+                    ->required(),
+                DatePicker::make('end_date')
+                    ->required()
+                    ->after('start_date'),
+            ]);
+    }
+
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->columns([
+                TextColumn::make('title'),
+                TextColumn::make('property_type')->formatStateUsing(\App\Support\StatusLabels::for('alert_property_type')),
+                TextColumn::make('price')
+                    ->money(strtolower(config('currencies.default'))),
+                TextColumn::make('area_sqft'),
+            ])
+            ->filters([
+                //
+            ])
+            ->recordActions([
+                ViewAction::make(),
+            ])
+            ->toolbarActions([
+                BulkActionGroup::make([
+                    DeleteBulkAction::make(),
+                ]),
+            ]);
+    }
+
+    public static function getRelations(): array
+    {
+        return [
+            //
+        ];
+    }
+
+    public static function getPages(): array
+    {
+        return [
+            'index' => ListMarketAnalyses::route('/'),
+            'create' => CreateMarketAnalysis::route('/create'),
+            'view' => ViewMarketAnalysis::route('/{record}'),
+        ];
+    }
+}

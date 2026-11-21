@@ -1,0 +1,264 @@
+#!/usr/bin/env sh
+set -e
+
+# Railway's persistent volume for storage/app arrives owned by root:root,
+# mode 0755 (no group/other write bit) -- regardless of the image's own
+# USER directive, since the volume is layered onto that path at container
+# start, after the image's baked-in ownership no longer applies there.
+# Confirmed live via a one-off diagnostic: whoami=octane (uid 1000), but
+# storage/app was root:root -- every write under it (property photo
+# seeding, any real upload) failed with "Unable to create a directory",
+# aborting the whole `db:seed` run partway through, every boot since this
+# volume was first provisioned.
+#
+# Fix it once, as root (the Dockerfile now ends with `USER root` so the
+# container starts privileged), then immediately re-exec this same script
+# as the unprivileged app user via su-exec before anything else runs
+# (migrations, seeding, the app server) -- so the application itself never
+# actually runs as root, only this one-time ownership fix does.
+if [ "$(id -u)" = "0" ]; then
+    chown -R "${USER}:${USER}" storage/app
+    exec su-exec "${USER}" "$0" "$@"
+fi
+
+# php.ini sets opcache.file_cache to this path, but PHP's opcache does not
+# create it itself -- on hosts where /tmp is a fresh, empty filesystem per
+# container boot (e.g. Railway), every PHP invocation (including this
+# script's own artisan calls below) fatal-errors with
+# "opcache.file_cache must be a full path of an accessible directory"
+# until the directory exists. Recreate it on every boot, before any php
+# command runs.
+mkdir -p /tmp/opcache-file-cache
+
+# storage/app/public specifically: now that the chown above has run,
+# this should always succeed -- kept as a lightweight, still-guarded
+# no-op for the very first boot after a fresh volume provision, where the
+# subdirectory genuinely doesn't exist yet.
+mkdir -p storage/app/public || \
+    echo "WARNING: could not prepare storage/app/public -- uploads/seeded photos will fail."
+
+container_mode=${CONTAINER_MODE:-"http"}
+running_migrations_and_seeders=${RUNNING_MIGRATIONS_AND_SEEDERS:-"false"}
+
+initialStuff() {
+    echo "Container mode: $container_mode"
+
+    # Give MySQL a chance to finish starting before the migrate/seed calls
+    # below hit it -- on a fresh compose stack the app container and the
+    # mysql container start at roughly the same time, and MySQL's own
+    # startup (initializing its data directory on first boot) can take
+    # longer than the app takes to reach this point.
+    echo "Waiting for MySQL database connection..."
+    db_retries=60
+    while ! php -r '
+        $host = getenv("DB_HOST") ?: "mysql";
+        $port = getenv("DB_PORT") ?: 3306;
+        $db   = getenv("DB_DATABASE") ?: "aqar";
+        $user = getenv("DB_USERNAME") ?: "aqar";
+        $pass = getenv("DB_PASSWORD") ?: "secret";
+        try {
+            new PDO("mysql:host={$host};port={$port};dbname={$db}", $user, $pass, [PDO::ATTR_TIMEOUT => 2]);
+            exit(0);
+        } catch (Throwable $e) {
+            exit(1);
+        }
+    ' 2>/dev/null; do
+        db_retries=$((db_retries - 1))
+        if [ "$db_retries" -le 0 ]; then
+            echo "WARNING: Database connection timed out after 120s, continuing anyway..."
+            break
+        fi
+        sleep 2
+    done
+    echo "MySQL database is ready and connected!"
+
+    # RESEED_FRESH: an explicit, deliberately-named, opt-in demo-reset
+    # button for this staging environment specifically -- distinct from
+    # RUNNING_MIGRATIONS_AND_SEEDERS (which only ever additively seeds).
+    # Several seeders (e.g. PropertySeeder, before it was fixed to check
+    # `Property::exists()` first) unconditionally create rows with no
+    # natural unique key, so a plain re-seed after a partial/interrupted
+    # prior run can leave duplicated demo data behind -- migrate:fresh is
+    # the only way to guarantee a genuinely clean slate. Never do this on
+    # an environment holding real user data (docs/PRODUCTION-DEPLOYMENT.md
+    # already documents why); this staging box only ever holds seeded demo
+    # content, so it's the appropriate "reset the demo" mechanism here.
+    # Always unset this variable again after use -- it is not meant to be
+    # left on.
+    if [ "${RESEED_FRESH:-false}" = "true" ]; then
+        # migrate:fresh only resets the DATABASE -- it never touches the
+        # filesystem. Every crashed/partial seed attempt (this exact
+        # mechanism has now caused several, while root-causing an unrelated
+        # PropertySeeder bug) left its already-written property photos
+        # behind on the persistent volume, since nothing ever cleaned them
+        # up. Confirmed live via Railway's own DISK_USAGE_GB metric: the
+        # 500MB volume was reading ~504MB used -- completely full -- which
+        # is what made every subsequent write deterministically fail with
+        # Spatie MediaLibrary's DiskCannotBeAccessed, crash-looping the
+        # container indefinitely regardless of what the seeder code itself
+        # did. Clear seeded media before reseeding so RESEED_FRESH actually
+        # delivers the clean slate its name promises, filesystem included.
+        echo "RESEED_FRESH=true: clearing seeded media from the persistent volume ..."
+        rm -rf storage/app/public
+        mkdir -p storage/app/public
+
+        echo "RESEED_FRESH=true: dropping and rebuilding the demo database from scratch ..."
+        php artisan migrate:fresh --seed --force
+    else
+        # Always apply pending migrations -- safe and idempotent on every
+        # boot, regardless of whether this boot should also seed demo data.
+        # Previously this was nested inside the seed-only conditional below,
+        # which meant a later deploy's new migrations would silently never
+        # run once the one-time seed flag was turned off.
+        php artisan migrate --isolated --force || php artisan migrate --force || true
+
+        if [ "${running_migrations_and_seeders}" = "true" ]; then
+            echo "Seeding demo database ..."
+            # DatabaseSeeder's last step, UserSeeder, deliberately throws in
+            # production (it only ever creates demo accounts with a
+            # hardcoded password). That's correct behavior -- but under
+            # `set -e` it was taking the whole container down, even though
+            # migrations and every seeder before it (site settings,
+            # permissions, roles, default team) had already applied
+            # successfully. Tolerate that specific, expected failure instead
+            # of crash-looping the container over it.
+            php artisan db:seed --force || true
+        fi
+    fi
+
+    # Create the first admin from ADMIN_EMAIL/ADMIN_PASSWORD (Railway
+    # variables, never committed to the repo) instead of UserSeeder's
+    # hardcoded demo password. Safe to leave on every boot: firstOrCreate
+    # makes it a no-op once the account exists.
+    if [ -n "${ADMIN_EMAIL}" ] && [ -n "${ADMIN_PASSWORD}" ]; then
+        echo "Ensuring first admin account exists ..."
+        php artisan tinker --execute='
+            $email = env("ADMIN_EMAIL");
+            $password = env("ADMIN_PASSWORD");
+            $user = \App\Models\User::firstOrCreate(
+                ["email" => $email],
+                [
+                    "name" => env("ADMIN_NAME", "Admin"),
+                    "password" => \Illuminate\Support\Facades\Hash::make($password),
+                    "email_verified_at" => now(),
+                ]
+            );
+            $team = \App\Models\Team::first();
+            if ($team) {
+                $user->teams()->syncWithoutDetaching([$team->id]);
+                if (is_null($user->current_team_id)) {
+                    $user->switchTeam($team);
+                }
+            }
+            $role = \App\Models\Role::where("name", "super_admin")->first();
+            if ($role) {
+                $user->assignRole($role);
+            }
+            echo "Admin ensured: {$email}\n";
+        ' || echo "WARNING: admin bootstrap failed, continuing boot anyway."
+    fi
+
+    # MIGRATE_MEDIA_TO_BUCKET: one-shot copy of media that predates object
+    # storage. Switching MEDIA_DISK to the bucket does not move any bytes --
+    # MediaLibrary keeps resolving the same relative paths, just against a
+    # different disk -- so without this every photo seeded onto the volume
+    # would 404 the moment the switch was flipped. The command never deletes
+    # from the source and skips anything already present at the destination,
+    # so leaving the flag on merely wastes a few seconds per boot rather than
+    # doing harm; still, turn it off once the copy has been confirmed.
+    if [ "${MIGRATE_MEDIA_TO_BUCKET:-false}" = "true" ]; then
+        echo "MIGRATE_MEDIA_TO_BUCKET=true: copying existing media into object storage ..."
+        php artisan media:migrate-to-object-storage --from=public --to=media \
+            || echo "WARNING: media migration failed, continuing boot anyway."
+    fi
+
+    # Reports whether media storage and its public URLs agree with each
+    # other. Cheap (one list + one signature) and safe to leave on: it only
+    # reads. Its value is that the one failure mode no test can reach -- a
+    # deployed MEDIA_URL that makes the disk, the route and the URL disagree
+    # -- becomes one readable line in the deploy log instead of every photo
+    # silently 404ing in a browser nobody has opened yet.
+    php artisan media:doctor || echo "WARNING: media configuration check failed, continuing boot anyway."
+
+    # MAIL_DOCTOR: send one message through the application's own mailer.
+    #
+    # A provider reporting a message as delivered and this application being
+    # able to send one are two different facts, and only the second matters:
+    # an API call says nothing about whether MAIL_HOST, MAIL_USERNAME and
+    # MAIL_PASSWORD are right or the SMTP port is reachable from here.
+    #
+    # Off by default -- it really does send mail, so leaving it on would
+    # email the contact inbox on every single boot.
+    if [ "${MAIL_DOCTOR:-false}" = "true" ]; then
+        php artisan mail:doctor || echo "WARNING: mail check failed, continuing boot anyway."
+    fi
+
+    php artisan storage:link
+    php artisan optimize
+}
+
+if [ "$1" != "" ]; then
+    exec "$@"
+elif [ "${container_mode}" = "http" ]; then
+    initialStuff
+    echo "Octane Server: ${OCTANE_SERVER}"
+
+    # Defensive cleanup: if the previous boot's Octane/RoadRunner process was
+    # ever killed abruptly enough (OOM, host restart) that a child process
+    # got orphaned instead of torn down, it can keep holding port 8000 and
+    # wedge every subsequent restart with "Unable to start server. Port 8000
+    # is already in use" -- exactly what happened here before workers were
+    # capped and opcache disabled (see supervisord.roadrunner.conf and
+    # php.ini). Clear the port first so a stale holder can never again
+    # permanently wedge the container (psmisc added to the image for
+    # `fuser`).
+    fuser -k -n tcp 8000 2>/dev/null || true
+
+    # DEMO_AUDIT: exercise the running demo over real HTTP once it is up.
+    #
+    # Backgrounded with a delay because it has to talk to the server this
+    # script is about to exec, not to the one that is not running yet. It is
+    # read-only -- GETs plus the login POST each persona needs -- and its
+    # output is the point: the staging host is unreachable from the machines
+    # this project is developed on, so without it "does the demo work" can
+    # only be answered by a person with a browser.
+    #
+    # Leave it off in normal operation. Every run logs in as all eight demo
+    # personas, which is noise on a box that is serving real visitors.
+    if [ "${DEMO_AUDIT:-false}" = "true" ]; then
+        (
+            sleep 25
+            php artisan demo:audit || echo "AUDIT| command failed to run"
+        ) &
+    fi
+
+    if [ "${OCTANE_SERVER}" = "frankenphp" ]; then
+        exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.frankenphp.conf
+    elif [ "${OCTANE_SERVER}" = "swoole" ]; then
+        exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.swoole.conf
+    elif [ "${OCTANE_SERVER}" = "roadrunner" ]; then
+        exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.roadrunner.conf
+    else
+        echo "Invalid Octane server supplied."
+        exit 1
+    fi
+elif [ "${container_mode}" = "horizon" ]; then
+    initialStuff
+    exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.horizon.conf
+elif [ "${container_mode}" = "reverb" ]; then
+    initialStuff
+    exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.reverb.conf
+elif [ "${container_mode}" = "scheduler" ]; then
+    initialStuff
+    exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.scheduler.conf
+elif [ "${container_mode}" = "worker" ]; then
+    if [ -z "${WORKER_COMMAND}" ]; then
+        echo "WORKER_COMMAND is undefined."
+        exit 1
+    fi
+    initialStuff
+    exec /usr/bin/supervisord -c /etc/supervisor/conf.d/supervisord.worker.conf
+else
+    echo "Container mode mismatched."
+    exit 1
+fi

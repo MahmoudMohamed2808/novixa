@@ -1,0 +1,80 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Property;
+use Illuminate\Support\Facades\DB;
+
+class MarketAnalysisService
+{
+    /**
+     * @param  array<int, string>|null  $statuses  restrict to these listing
+     *   statuses — sale prices and monthly rents share the `price` column, so
+     *   averaging across both produces a meaningless "market price".
+     */
+    public function generateMarketAnalysis($startDate, $endDate, $teamId, $propertyIds = null, ?array $statuses = null)
+    {
+        $baseQuery = function () use ($startDate, $endDate, $teamId, $propertyIds, $statuses) {
+            $query = Property::query()
+                ->where('team_id', $teamId)
+                ->whereBetween('created_at', [$startDate, $endDate]);
+
+            if ($propertyIds) {
+                $query->whereIn('id', $propertyIds);
+            }
+
+            if ($statuses) {
+                $query->whereIn('status', $statuses);
+            }
+
+            return $query;
+        };
+
+        $marketData = $baseQuery()->select(
+            DB::raw('AVG(price) as avg_price'),
+            DB::raw('MIN(price) as min_price'),
+            DB::raw('MAX(price) as max_price'),
+            DB::raw('AVG(area_sqft) as avg_area'),
+            DB::raw('COUNT(*) as total_properties'),
+            'property_type'
+        )
+        ->groupBy('property_type')
+        ->get();
+
+        $pricePerSqFt = $baseQuery()->select(
+            DB::raw('AVG(price / area_sqft) as avg_price_per_sqft'),
+            'property_type'
+        )
+        ->groupBy('property_type')
+        ->get();
+
+        return [
+            'market_data' => $marketData,
+            'price_per_sqft' => $pricePerSqFt,
+            'start_date' => $startDate,
+            'end_date' => $endDate
+        ];
+    }
+
+    public function getMarketTrends($startDate, $endDate, $teamId, $propertyIds = null)
+    {
+        $query = Property::query()
+            ->where('team_id', $teamId)
+            ->whereBetween('created_at', [$startDate, $endDate]);
+
+        if ($propertyIds) {
+            $query->whereIn('id', $propertyIds);
+        }
+
+        $trends = $query->select(
+            DB::raw('DATE_FORMAT(created_at, "%Y-%m") as month'),
+            DB::raw('AVG(price) as avg_price'),
+            'property_type'
+        )
+        ->groupBy('month', 'property_type')
+        ->orderBy('month')
+        ->get();
+
+        return $trends;
+    }
+}

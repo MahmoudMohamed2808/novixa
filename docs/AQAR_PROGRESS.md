@@ -1,0 +1,944 @@
+# Aqar Rescue — Progress Log
+
+Chronological. Anyone should be able to read this and know the actual current state without re-deriving it.
+
+---
+
+## 2026-08-20 — Phase 0: Baseline & Safety
+
+**State confirmed:** branch `feature/aqar-productization` @ `f58eac8`, working tree has 48 pre-existing uncommitted changes (unrelated in-progress localization/currency work + 3 file deletions from an earlier live-corruption-bug fix — see `AQAR_PRE_RELEASE_AUDIT_REPORT.md` Section 2). PHP 8.4.16 via `herd/bin/php84/php.exe` (default `php` on PATH is 8.4.0 and fatally errors). MySQL up, dev DB migrated + seeded (`docs/TEST_USERS.md` accounts exist). Node v24.15.0, npm 11.12.1.
+
+**Tests:** `php artisan test` → 558 passed / 0 failed / 32 skipped / 2094 assertions, exit 0. `php artisan route:list` → 669 routes, exit 0.
+
+**Docs created:** `CLAUDE.md`, `docs/AQAR_RULES.md`, `docs/AQAR_EXECUTION_PLAN.md`, `docs/AQAR_TASKS.md`, `docs/AQAR_DECISIONS.md`, this file.
+
+**Discovered blockers:** see `AQAR_PRE_RELEASE_AUDIT_REPORT.md` — 8 P0s, 21 P1s. Most severe: P0-3, six of nine Filament panels return HTTP 500 on first authenticated page load (root-caused to the exact line/import in each case).
+
+**Next:** Phase 1 — fix P0-3A/B/C and P0-2.
+
+---
+
+## 2026-08-20 — Phase 1: P0-3 (panel crashes) and P0-2 (IDOR) fixed and verified live
+
+**P0-3 (6 of 9 panels crashing on login) — FIXED**, commit `2159108`. Root-caused to 3 independent bugs (Bug A: wrong `EditProfile` import + empty `->pages([])` in 5 PanelProviders; Bug B: `properties.tenant_id`/`tenants.id` confusion in Tenant Dashboard + 2 widgets; Bug C, found mid-fix: `transaction_amount`/`transaction_date` vs. real columns `amount`/`date`, present in 6 files across App/Staff panels, far more widespread than the audit report's original single-file citation). Also found and fixed a 4th crash (P0-3D) that only became reachable once P0-3B was fixed: Tenant dashboard blade manually echoed a raw widgets array instead of letting Filament auto-render it.
+
+**P0-2 (cross-tenant IDOR in Tenant Maintenance Requests) — FIXED**, commit `50e1d3f`. Added `getEloquentQuery()` scoped through the `Tenant` record (not `auth()->id()` directly — same tenant_id/user_id confusion as P0-3B). Verified with temporary test data (2 tenants, 1 request each) — tenant 1's scoped query returns only their own record. Test data removed after verification.
+
+**Verification performed:**
+- Restarted `php artisan serve` fresh after each fix batch.
+- Logged into all 9 seeded personas (`docs/TEST_USERS.md`) plus explicit checks on `/staff/dashboard` and `/staff/transactions` (11 checks total) via Playwright — **0 HTTP errors, 0 JS console errors**, down from 6 of 9 panels returning HTTP 500 at the start of this session.
+- Full test suite re-run 3 times across this session (after Phase 5 commit, after P0-3 fix, after P0-2 fix): **558 passed / 0 failed / 32 skipped** every time — no regressions.
+
+**New findings logged** (not fixes, tracked for later): P2-NEW-1 (no seeded `Tenant`/`MaintenanceRequest` records — demo-realism gap, Phase 4), P2-NEW-2 (`tenants` table identity-model observation, see `docs/AQAR_DECISIONS.md`).
+
+**Next:** continue Phase 1 — P0-1 (authorization fails open), P0-7 (brand collision), P0-4 (unrouted MVP forms), then the environment-provisioning items (P0-5, P0-6, P0-8, P1-21).
+
+---
+
+## 2026-08-20 — Phase 1 continued: P0-7, P0-4, P0-1, and P0-5 fixed and verified live
+
+**P0-7 (brand collision) — FIXED**, commit `c0fae89`. Found the site-wide title/footer/about/contact collision the original report described was already resolved by prior work on this branch; the surviving live inconsistency was `terms-and-conditions.blade.php`/`privacy-policy.blade.php` referring to "Novixa Aqar platform" — the one name a visitor would never see anywhere else on the public site. Fixed those two pages' "which service are you using" framing to Dar Hadhramaut, left the legitimate "Powered by Novixa Aqar" attribution and IP-ownership clause alone.
+
+**P0-4 (unrouted MVP forms) — FIXED**, commit `aefbe26`. Routed `/submit-property` and `/property-request`, added discoverable nav entries (`MenuSeeder.php`). End-to-end Playwright verification (fill + submit, check DB for a real created record) caught a second bug beyond routing: `PropertySubmissionForm`'s blade view had no input at all for `year_built`, which validation marked required — every real submission would have failed forever. Fixed by adding the field and relaxing the rule to `nullable` (matching the fallback default already coded in `submit()`); updated the one test that encoded the old broken requirement.
+
+**P0-1 (authorization) — FIXED**, commit `bb0b39a`, the largest fix of the session. Generated real Policies for all 32 unique models via `shield:generate` across all 9 panels. While doing this, found something significantly worse than the original "5 of 45 policied" framing: **every role except super_admin had zero permissions granted, full stop, predating this session** — `config/filament-shield.php`'s permission naming (`View:Property`) never matched `RolesSeeder.php`'s case-sensitive snake_case checks (`view_property`). Fixed via a custom `FilamentShield::buildPermissionKeyUsing()` closure. Also completed the 5 pre-existing hand-written policies (all missing `viewAny`/`create`/`delete` — `PropertyPolicy` had none of the three, which alone would have blocked property browsing for every non-admin role even after the naming fix), and fixed 2 more `RolesSeeder.php` naming mismatches found by auditing every permission pattern against real DB names (`communication_hub`→`message`, `contractor`→`user` — both resources use a different underlying model than their name implies).
+
+**P0-5 (multi-tenant portal-sync leak) — FIXED**, pending commit. `RightMoveService`/`OnTheMarketService`/`ZooplaApiService` all read a single global API key and queried `Property::all()`/`needsSyncing()` with no team filter. Added a `forSettings()` configuration method to each (per-team API key + `team_id` scope), changed the 3 jobs to take a settings row, changed the 3 commands to dispatch one job per active team per frequency tier, and removed the `routes/console.php` `->when()` gates that — like an identical bug in P0-1 — only ever checked the *first* active settings row. `ZooplaSettings` had no `team_id` column at all (its two siblings did) — added via migration. Also fixed the related P1-9 bug (`needsSyncing()` comparing a column to a string literal). **Correction to the original audit's suggested fix**: the existing `PortalIntegration`/`PortalSyncService` system is not a working replacement, just a status-tracking stub with no real external API calls — fixing the legacy services directly was the right call, not routing through it.
+
+**Verification across all four fixes:**
+- Full test suite re-run after each fix (5 more runs this session): consistently 559 passed / 0 failed / 32 skipped, one test (`AgentPerformanceReportTest`) updated to seed real permissions instead of a bare role record, now that authorization is actually enforced.
+- P0-5 specifically verified with `Http::fake()` + 2 real teams/settings/properties: exactly 2 HTTP calls recorded, each hitting the correct team's own `base_uri` with that team's own `api_key` — zero cross-tenant leakage. Test data cleaned up after (had to `forceDelete()` — `Property` uses soft deletes).
+- Direct `Gate::allows()` spot checks confirm P0-1 authorization is correctly restrictive (staff: view/create yes, delete no; buyer: view property yes, create/delete/view-users no) and live browser walkthroughs of all 9 panels + Staff dashboard/transactions show 0 errors, with staff correctly getting 403 on `/admin/users`.
+
+**Remaining P0s: P0-6 (`APP_URL`) and P0-8 (PHP version) are environment-provisioning tasks** — they depend on whatever host actually serves the public demo and can't be meaningfully "fixed" in this repo; they're a pre-launch checklist item, not a code change. All P0s that are genuine code fixes are now done.
+
+**Next:** P1 items (Section 5 of the audit report) — 21 items, none release-blocking but materially affecting reliability/UX/professionalism. Highest-value next: P1-21 (`APP_DEBUG`), P1-1 (rate limiting), P1-15/16 (Payments/auth test coverage).
+
+---
+
+## 2026-08-20 — P1 batch: rate limiting, e-signature import, hardcoded currency
+
+**P1-1 (no rate limiting) — FIXED.** Applied `throttle:login`/`throttle:register` to the manually-declared POST routes in `routes/web.php` — the limiters themselves (5/min login, 3/min register) already existed in `FortifyServiceProvider.php`, just orphaned. Verified live with a real Playwright browser session: attempts 1-5 return 302 (normal failed-login), attempt 6 returns 429.
+
+**P1-2 (e-signature `is_signed`) — PARTIALLY FIXED, honestly.** Added the missing `LeaseAgreement` import, but investigated further and found the check is structurally dead regardless of the import: `Document` and `LeaseAgreement` are sibling models with no shared hierarchy or polymorphic link, and `signDocument()` is only ever called with a `Document` instance (confirmed by checking both call sites). Fixing this for real needs a product decision about the actual Document↔LeaseAgreement signing relationship — documented inline in the service and in `docs/AQAR_DECISIONS.md` rather than claiming a fix that doesn't actually change behavior.
+
+**P1-11/P1-12 (hardcoded `$`/USD) — FIXED.** Notifications now use the existing `$property->formatted_price` accessor (per-property currency); payment tables now use `strtolower(config('currencies.default'))`, matching the pattern already established in `RecentTransactions.php` (Payment has no per-record currency, unlike Property).
+
+**Verification:** full test suite re-run 3x across this batch, consistently 559/0/32. Live: `/tenant/payments` still loads with 0 errors after the currency-column change.
+
+**Next:** continuing through P1 — P1-3/P1-4 (e-signature CRUD exposure + no Filament trigger action), P1-13 (in-panel language switcher), P1-19 (sitemap), P1-21 (`APP_DEBUG` — environment, checklist-only), then P1-15/16 (Payments/auth test coverage, larger effort).
+
+---
+
+## 2026-08-20 — P1-3 fixed; found and fixed a second seeded-data gap (`current_team_id`)
+
+**P1-3 (e-signature flags directly PATCH-able via API) — FIXED.** Removed `is_signed`/`landlord_signed`/`tenant_signed` from `TenancyAgreementController::rules()` — `Request::validate()` only ever returns keys present in its rules array, so these 3 fields are now unconditionally stripped from any request body regardless of what a client sends. All 3 default `false` at the DB level, so `store()` behavior is unchanged. `renew()`'s own direct reset of these flags (legitimate server-side logic, not user input) is untouched.
+
+**Found while verifying it, fixed the same session: `current_team_id` was `NULL` for all 8 seeded demo users.** `UserSeeder.php` attached each user to a team but never called Jetstream's `switchTeam()` to set the "active" team column — any code path reading `current_team_id` directly (confirmed for the V1 API's `teamId()` check) threw "Select an organisation you belong to" for every single seeded persona, including admin. Added `switchTeam()` calls to the seeder; re-ran it against the dev DB; confirmed all 8 users now resolve `current_team_id=1`. Not exhaustively audited for every other call site that might read this column directly — flagged in `docs/AQAR_DECISIONS.md` for a future session.
+
+**Verification:** `rules()` checked via reflection with a real authenticated, team-attached user — all 3 flags confirmed absent, `status` confirmed still present. Full test suite: 559 passed / 0 failed / 32 skipped, unchanged.
+
+---
+
+## 2026-08-20 — P1-17 (`.env.example`) and P1-19 (sitemap) fixed; property status found to have 3 naming conventions
+
+**P1-17/P2-8/P2-16 (`.env.example` completeness) — FIXED.** `OCTANE_SERVER=swoole` → `roadrunner` (only RoadRunner is installed); deduped the conflicting `SESSION_DRIVER`/`SESSION_SECURE_COOKIE` lines (kept the previously-effective values, no behavior change); added the entirely-missing `REVERB_*` vars. Deliberately left `QUEUE_CONNECTION=sync`/`CACHE_DRIVER=file` (P2-17) and `BROADCAST_DRIVER=log` alone — flipping either to `redis`/`reverb` would break a zero-dependency fresh install unless those services are actually running; added explanatory comments instead.
+
+**P1-19 (sitemap) — FIXED, and found significantly worse than described.** Added all static/legal pages, both new MVP forms, and published news articles to `GenerateSitemapCommand`; added a daily `Schedule::command('sitemap:generate')` (there was none). While verifying, **found the sitemap has never included a single property, ever** — its status filter checked for `'published'`/`'active'`/`'available'`, values that don't exist anywhere in this codebase. Investigating further surfaced a genuine, previously-undiscovered data-integrity issue: `properties.status` is written with **three different naming conventions** depending on code path - `PropertySeeder.php` writes Title Case (`'For Sale'`), the Filament property form's `Select` options save snake_case (`'for_sale'`), and the sitemap's original filter matched neither. Fixed the sitemap defensively (matches all real variants); the underlying 3-convention inconsistency is not fixed at the root — would need a data migration and likely a PHP enum, logged as a follow-up in `docs/AQAR_DECISIONS.md`, not attempted speculatively here.
+
+Also synced `robots.txt`'s `Sitemap:` directive from the same command, since a plain static file can't read `config('app.url')` at request time the way the `sitemap.xml` route already does — this reuses the existing "fix `APP_URL`, regenerate the sitemap" deploy step already documented for P0-6, rather than adding a new step to forget.
+
+**Verification:** sitemap regenerated 3x confirming idempotency (stable at 44 URLs, 1 `Sitemap:` line in `robots.txt`, was 16 URLs/0 properties before); live `/sitemap.xml` and `/robots.txt` both serve correctly; `artisan schedule:list` confirms the new daily entry. Full test suite: 559 passed / 0 failed / 32 skipped, unchanged.
+
+---
+
+## 2026-08-20 — New directive: full production-readiness pass, user-flagged UI/translation/theme/docs issues
+
+User confirmed no further P0/P1 backend items take priority right now — the active mandate is broader: "make sure everything is ready for production," explicitly flagging (from live use of the app) bad/non-responsive UI, incomplete Arabic translation and RTL support "in many places, pages, sections, everywhere" (both DB-sourced content and app-internal strings), bad component design when switching light/dark theme, and unrefactored `.md` docs. Full authority granted to prioritize and execute as judged best.
+
+**Action taken in response, this session:**
+1. **Launched a background visual UI/UX audit agent** (general-purpose, explicitly not using `isolation: "worktree"` — see the standing lesson in `docs/AQAR_DECISIONS.md`) to screenshot and inspect ~18 pages/panels across light/dark theme × AR/EN × desktop/mobile, specifically hunting dark-mode component bugs, RTL layout issues, and untranslated text (categorized by DB vs. app-code source). **Still running as of this entry — no findings yet.**
+2. **Executed the documentation refactor** (Section 17 of the audit report, previously only recommended, now done) in parallel since it's independent of the visual audit. See the new decision log entry above for what moved and the concrete finding that validated doing it (`TASK-004`/`TASK-005` falsely claiming Arabic/RTL "COMPLETED & VERIFIED" on the strength of a passing test suite alone). Root `.md` count: 22 → 9. `docs/` top-level: 28 → 25 (net; added `docs/archive/README.md`, removed the 4 archived feature-summaries, renamed 2). Full inventory now: `docs/archive/2026-02-pre-rescue/{audit,project,tasks,root-reports,feature-summaries}/` (82 files) plus a README explaining why and pointing to the current source of truth.
+
+**Not yet done:** the actual UI/translation/theme fixes the user is waiting on — blocked on the visual audit agent's results, which will drive a prioritized fix list. Test suite not re-run this entry since no application code changed (docs-only).
+
+**Next:** synthesize the visual audit's findings into concrete fixes (dark-mode CSS/component issues, RTL layout bugs, translation-key gaps) the moment it completes; in parallel, start a systematic sweep for untranslated app-internal strings (Blade/Filament/Livewire) and DB-sourced content needing translation, since that doesn't require the audit's screenshots to begin.
+
+---
+
+## 2026-08-20 — P1-14 (flash messages) fixed; found and fixed P0-7's real root cause
+
+**P1-14 (Livewire/Controller flash messages untranslated) — FIXED**, commit `fe1e2b3`. Found 34 hardcoded flash-message call sites across 21 files (27 in `app/Livewire/*`, 4 in `app/Http/Controllers/*`, plus 2 already-Arabic-hardcoded ones from this session's own P0-4 fix — which had the mirror-image bug, forcing Arabic on English-locale users). Wrapped all in `__()`, added the 35 resulting keys to both `lang/en.json`/`lang/ar.json`, restructured the 2 dynamic (date/time-interpolated) messages and 1 multi-branch error message to use `:placeholder` substitution. Full suite re-run: 559/0/32, unchanged.
+
+**Investigating DB-sourced content translation (the other half of the user's complaint) surfaced a real, deeper bug in P0-7**, which this session had already marked FIXED. Live-checked `GeneralSettings` (the settings class backing site name/footer/contact info, read on every public page) and found it still held unrelated upstream-template defaults (`site_name = "Novixa Aqar"`, `site_currency = "GBP"`) — not the Yemen-correct, brand-consistent values in `database/seeders/SiteSettingsSeeder.php`, because that seeder was commented out of `DatabaseSeeder.php` and had therefore never run. This means the earlier P0-7 fix (2 legal-page edits) was correct as far as it went but incomplete — the actual dynamic site identity was still wrong, just unverified at the time. Uncommented the seeder, ran it against the dev DB, verified via live `curl` that the brand name/copyright is now consistent site-wide with exactly one correct "Developed by: Novixa Aqar" attribution remaining. Full suite: 559/0/32, unchanged. Full writeup in `docs/AQAR_DECISIONS.md`.
+
+**Also checked:** DB-content localization more broadly (property descriptions, news articles) — confirmed `properties`/`news` tables have single-value `title`/`description`/`content` columns with no per-locale storage at all, and confirmed seeded content is genuinely Arabic throughout (matches the Arabic-first primary market). This is a real structural gap for a true bilingual experience, but not a demo blocker for the primary (Arabic) locale — logged as a post-demo architecture item (needs `spatie/laravel-translatable` or dual-column migration across multiple models), not attempted speculatively given the blast radius.
+
+**Next:** app-internal static-string sweep (Blade/Filament labels not yet using `__()`) using the same mechanical pattern as P1-14; check on the visual UI/UX audit agent (still running).
+
+---
+
+## 2026-08-20 — Filament label/placeholder/helperText sweep; 2 background agents dispatched for remaining scope
+
+**Filament hardcoded strings — FIXED**, pending commit. Grepped all of `app/Filament/**/*.php` for explicit `->label(`/`->placeholder(`/`->helperText(` calls with raw string literals (Filament's own field-name-humanization auto-labels weren't in scope here — a much larger, separate concern, see decision log). Found 29 hardcoded strings across 8 files (mostly `Admin/Resources/Users/*` and a few Staff resources: Property, PropertyTemplate, News, Lead, Alert). Wrapped 28 in `__()` (left `'user@example.com'` alone — it's a format example, not translatable content) and added the 26 resulting unique keys to both lang files. Verified: `php -l` clean on all 8 files, both JSON files parse with matching +26 key counts (171/157), `tinker` confirms `__()` resolves correctly to real Arabic in the `ar` locale and identity English in `en` for a sample of the new keys. Full suite re-run in progress.
+
+**Dispatched two background agents this session, both still running, to cover ground in parallel without duplicating this direct work:**
+1. Visual UI/UX audit (dispatched earlier) — screenshots across light/dark × AR/EN × desktop/mobile, hunting dark-mode/RTL/responsive bugs and untranslated visible text. No results yet.
+2. Blade-view translation sweep (dispatched this entry) — scoped to the ~78 Blade files identified as using neither `__()` nor the inline locale-ternary pattern, after filtering out pure structural/wrapper components. Briefed with the exact convention established in the P1-14 commit, full verification requirements (JSON validity, full test suite, live spot-check), and explicit instructions to confirm branch before starting (the worktree lesson). No results yet.
+
+**Not covered by either agent, still open:** Filament's *auto-generated* field labels (the majority of form/table labels across ~45 resources, which Filament humanizes from the English column name by default rather than reading any translation) — this is a much larger, structurally different problem than the explicit-string cases just fixed. Not attempted this session; see decision log for reasoning on scope/priority.
+
+---
+
+## 2026-08-20 — Both background agents hit the account session limit; picked up their partial findings directly
+
+Both agents dispatched earlier this entry (visual audit, Blade translation sweep) failed with the same error — an account-level session limit, resets 11:20pm Asia/Riyadh — before making any file edits (confirmed via `git status` immediately after). Rather than wait for reset or re-dispatch (likely to fail again immediately), independently verified and acted on what each had found in its last message before stopping:
+
+**RTL arrow-mirroring bug — FIXED**, commit pending. `services.blade.php` had 6 "Read More" arrows (`&rarr;`) with no RTL mirroring, unlike the correct pattern already established in `home.blade.php` (`rotate-180` conditional on Arabic locale). Fixed all 6, then grepped the whole `resources/views` tree for the same glyph and found 2 more unmirrored instances in `livewire/news-list.blade.php` that the interrupted agent hadn't reached yet — fixed those too. All 11 arrow instances site-wide now consistently mirror. Verified: `php -l` clean on both files, live `curl` of `/services` shows 6/6 arrows carrying `rotate-180` in the default Arabic locale. Full test suite re-run in progress.
+
+**Dead-code finding — no fix applied, documented instead.** `resources/views/bookings/{create,edit,index}.blade.php` and `components/{manage_section,products_section,home-header}.blade.php` are unreachable (no matching routes, `BookingController` only returns JSON/ICS, no `view()`/`@include`/component-tag references anywhere) — independently re-verified via grep, confirmed correct. Deliberately did not translate (wasted effort on unreachable code) or delete (a separate, more consequential decision) — logged in `docs/AQAR_DECISIONS.md` so a future pass doesn't waste time either re-investigating or re-discovering this.
+
+**Next:** once the test suite confirms no regression, commit the arrow fix. Re-assess background-agent dispatch once the session limit resets; until then, continue the remaining translation/UI work (Filament auto-label gap, dark-mode/RTL sweep beyond what the interrupted visual audit reached) directly.
+
+---
+
+## 2026-08-20 — Systematic dark-mode sweep of public/tenant Blade views
+
+RTL arrow fix confirmed clean (559/0/32). Followed up on the user's "bad design for some components when switching between light and dark theme" complaint directly, since the visual-audit agent that was investigating this got cut off by the session limit before reaching it.
+
+**Method:** grepped `resources/views/**/*.blade.php` for solid `bg-white` (excluding `bg-white/NN` opacity overlays, which are intentional on colored hero sections) with no `dark:bg-` on the same line — the classic "forgot dark mode" signature. Found ~25 real instances across ~15 files. Cross-checked usage of a few shared components before fixing (`components/button.blade.php` turned out already correct — `bg-gray-800 dark:bg-gray-200` — false positive from truncated grep output; `components/authentication-card.blade.php` confirmed used by 4 real auth pages via grep).
+
+**Fixed this entry** (11 files, all `php -l` clean, both lang JSON files still valid after 2 new keys):
+- `components/authentication-card.blade.php` — the shared wrapper for confirm-password/reset-password/two-factor-challenge/verify-email. Was a solid white card with no dark background at all.
+- `components/confirmation-modal.blade.php` — Jetstream's destructive-action confirmation dialog (e.g. account deletion). Every color in it (background, both text tones, icon, footer) was light-only.
+- `components/action-link.blade.php` — small reusable link component.
+- `tenant/payment-portal.blade.php`, `tenant/applications.blade.php`, `livewire/tenant/payment-history.blade.php` — the whole tenant self-service payment/applications area predates both the dark-mode and i18n conventions used elsewhere: fixed dark mode throughout, and along the way found 2 more hardcoded English strings ("Make a Payment", "Payment History") with zero translation mechanism — wrapped in `__()`, added to both lang files.
+- `livewire/tenant-review-form.blade.php`, `livewire/landlord-review-form.blade.php` — same "predates both conventions" pattern: fully hardcoded English, zero dark: classes anywhere. Brought up to the same bilingual-ternary + dark: standard as their sibling `livewire/property-review-form.blade.php` (which itself only had the translation half done, not dark mode — fixed that gap too).
+- `livewire/valuation-booking.blade.php`, `livewire/booking-calendar.blade.php` — fixed the outer card containers and repeated action buttons (the highest-visual-impact elements — a solid white panel against a dark page background). Did **not** exhaustively fix every nested element in these two large, complex files (multi-step calendar UI) — lower traffic than the auth/tenant-portal pages fixed above, and doing it properly needs more time than remained in this pass.
+
+**Verification, honestly stated:** all touched files are `php -l` clean; the `dark:` classes added match a pattern already proven working in dozens of other files in this codebase (e.g. `property-detail.blade.php`), so this is low structural risk — pure additive CSS, no logic changes. Full test suite re-run (pending at time of writing this entry). **Not yet verified via live authenticated browser rendering** — the affected pages (tenant portal, auth flows) require a logged-in session, and a full Playwright login-and-screenshot pass wasn't done this entry. This is a real gap in verification rigor compared to the P0/P1 fixes earlier this session, noted explicitly rather than glossed over.
+
+**Not yet touched, catalogued for a follow-up pass:** `livewire/custom-report-form.blade.php`, `custom-reports/index.blade.php`, `livewire/investment-analysis.blade.php`, `livewire/property-preview.blade.php` (registered as a real Livewire component per `LivewireComponentServiceProvider.php`, reachability from an actual route not confirmed) all had the same `bg-white`-with-no-dark-variant signature in the original grep and were not reached this entry. Also unexamined: `resources/views/filament/**` blade templates (dashboard/widget views) and the 9 Filament panels' own dark-mode rendering, which uses Filament's *own* separate built-in dark-mode system (distinct from this app's `dark:` Tailwind classes) and wasn't in scope for this grep at all.
+
+---
+
+## 2026-08-24 — Comprehensive independent re-audit (Phase 13): READY WITH FIXES, full report + corrected task log
+
+User requested a full production-readiness audit per a 41-section brief (architecture, demo scope, page-by-page, DB, translation, RTL, theme, responsive, a11y, SEO, files/media, auth, security, performance, error handling, browser/console, tests, build/deploy, env vars, disconnected features, branding, demo credibility, scored readiness). Confirmed branch/commit (`feature/aqar-productization` @ `41a8787`, clean tree) before starting, per the standing Git rule.
+
+**Method:** did not trust Phase 0-12's "release gate PASS" at face value (per `AQAR_RULES.md` rule 2 and the standing "no status claim without re-running it" discipline this repo's own decision log established). Ran everything live: `migrate:fresh --seed` against the real dev DB, the full test suite, `npm run build`, and a real Playwright Chromium session logging into all 8 personas + super_admin and loading 11 public routes × 2 locales with console/page/network-error capture. In parallel, dispatched 4 independent background audit agents (DB/seeders, translation/RTL/theme, Filament/routes/security, frontend/SEO/media), each explicitly briefed to re-verify prior claims against current code rather than assume them, working directly in the real working tree (no `isolation: "worktree"`, per the standing lesson in `docs/AQAR_DECISIONS.md`).
+
+**Result: the large majority of Phase 0-12 holds up.** All 9 panel logins, live-verified this session: 200s, zero console/page/failed-request errors — genuinely confirms the release-gate claim for that surface. Full test suite: 553 passed / 0 failed / 32 skipped (2130 assertions, 22.7 min — the unusually long duration traced to CPU contention with a concurrently-running seed, not a suite regression), matching the established baseline exactly.
+
+**But re-verification surfaced real, previously-undetected defects, several severe enough to change the launch verdict from an unconditional PASS to READY WITH FIXES:**
+
+1. **`migrate:fresh --seed` fatally crashes** on PHP's stock 128M CLI `memory_limit` (`Allowed memory size ... exhausted` in `PropertySeeder`'s media-conversion step, `vendor/spatie/image/.../GdDriver.php`). Reproduced twice. Confirmed the seed completes cleanly with a raised memory limit (full post-seed DB counts matched every expected total). This means the exact command this repo's own `CLAUDE.md`/testing docs direct a developer to run does not work out of the box — a real gap between documented setup and actual behavior.
+2. **Live-reproduced, not inferred:** every property photo on every public page fails to load (browser-console CSP `img-src` violation) whenever the serving origin doesn't exactly match `APP_URL` — confirmed by running the QA browser on a different port than `.env`'s configured `APP_URL`. This is the same root cause as the already-documented P0-6 (`.env.example` already carries a comment warning about it), but this session is the first to actually reproduce the failure live and confirm its true blast radius: the entire public site's images disappear, not just canonical/OG metadata.
+3. **`PropertyModerationResource` writes to two columns that don't exist** (`moderated_at`, `moderation_notes`) and overloads `properties.status` — already known to have naming problems — with a third, incompatible meaning.
+4. **118 keys in `lang/en.json` map to Arabic text**, not English (the entire Jetstream Team/2FA/API-Token/Browser-Sessions vocabulary) — an English-locale demo viewer sees Arabic mixed into English pages on Profile/Team/2FA. Not catchable by a green test suite or even a console-error check (the page renders fine, just wrong-language).
+5. **P1-13 ("no language switcher") was never actually fixed** — the `21ba4e9` commit credited with fixing it built a cross-*panel* navigator (switch between Admin/Staff/Buyer/etc.), not a language toggle. Independently re-verified: zero `?lang=`/language-switch UI exists anywhere, public site or any of the 9 panels. Reopened in `docs/AQAR_TASKS.md` with a note explaining the mislabeling, rather than silently overwriting the existing FIXED entry.
+6. **A credible new cross-tenant IDOR**, same bug class as the original (fixed) P0-2, in a code path P0-2's fix never touched: the V1 API's `MaintenanceController`/`TenantCrudController` scope by `team_id` only, and `MaintenanceRequestPolicy` has no record-level ownership check. Not confirmed via a live exploit this session (would need to confirm a seeded persona holds the relevant `AgencyRole` grant) — flagged as HIGH, not BLOCKER, pending that follow-up.
+7. **Login/Register/Forgot-Password — the 3 highest-traffic pages in the app — never got the dark-mode fix** applied to their sibling auth pages in the 2026-08-20 dark-mode sweep (those three use their own raw markup instead of the shared `<x-authentication-card>` component that was fixed).
+8. Several MEDIUM/LOW findings: `properties.status`'s naming chaos is 5-way not 3-way with a concrete consequence (Agent Performance "Properties Sold" always reads 0 against seed data); `lease_agreements` fully wired in the Staff panel but never seeded (empty next to its populated `leases` sibling); `ImagePolicy::view()` still missing (P0-1's "completed" claim only partially true); `PermissionsSeeder` takes ~7 minutes on every seed (reproduced twice, a real CI/deploy timing risk); property-detail shows only 1 of the 2-3 seeded photos per property (no gallery UI); a leftover `liberu` template default in `docker-compose.yml` (separate from `.env.example`, already fixed there).
+
+**Also independently re-confirmed clean, worth recording since it validates rather than repeats prior work:** authorization (P0-1/P0-2/P1-7 fixes all still correctly applied, live-spot-checked), CSP/CSRF/mass-assignment/secrets hygiene, RTL (near-perfectly clean), Filament's own built-in dark-mode system (consistent across all 9 panels, resolves a previously-flagged "unaudited" gap as a non-issue), zero lorem-ipsum/placeholder content anywhere, zero raw-translation-key-render risk across 395 `__()` call sites, storage symlink present, sitemap/robots.txt correct, image alt-text 100% present, and several files the progress log listed as "not yet touched" (`custom-report-form`, `custom-reports/index`, `investment-analysis`) turned out already fully bilingual and dark-mode-covered — the log was stale in the better-than-claimed direction on that point.
+
+**Verdict: READY WITH FIXES** (not NOT READY — this is a materially different, better state than the 2026-08-20 baseline; but not an unconditional PASS either). Full report with page-by-page detail, scored dimensions, and a prioritized action plan: `docs/AQAR-DEMO-READINESS-AUDIT.md`. Findings logged in `docs/AQAR_TASKS.md` under "Phase 13."
+
+**Next:** fix the 2 blocker-class items (seed memory crash, `APP_URL`/CSP image failure) and the 6 HIGH items before any public demo; MEDIUM/LOW items can ship as-is or be scheduled post-demo per the report's prioritized action plan.
+
+---
+
+## 2026-08-25 — Phase 14: all Phase 13 critical/high items fixed and verified; READY
+
+Fixed all 12 Phase 13 findings plus the reopened P1-13 language switcher (see `docs/AQAR_TASKS.md` Phase 14 for the item-by-item list). Full verification record in the new `docs/AQAR-FINAL-RELEASE-QA.md`; new `docs/PRODUCTION-DEPLOYMENT.md` and `docs/RELEASE-CHECKLIST.md`.
+
+**Worth recording explicitly: caught and fixed my own regression mid-pass, via the test suite doing exactly its job.** The first version of the `properties.status` normalization (P13-8) was too broad — it collapsed the legitimate, independent value `available` (and `active`/`to_let`/`sstc`/`exchanged`/`let`/`let_agreed`) into the 4 canonical listing-status values, not realizing `status` also carries a second, real vocabulary used by the V1 API's `AutomationController`. `CoreAgencyApiTest`'s automation test failed immediately on the first post-fix suite run. Root-caused, narrowed the normalization to only the 4 unambiguous legacy Title-Case strings, re-ran the suite twice more, found (and correctly fixed, not weakened) 2 more pre-existing tests that had encoded the *original* bug as expected behavior. Final: 553 passed / 0 failed / 32 skipped, unchanged from the pre-fix baseline.
+
+**Verification performed:** `migrate:fresh --seed` run 3× this session (once to confirm the original crash reproduces, once to confirm the fix works at the stock 128M memory default, once more after the regression correction) — all exit 0. Full test suite run 4× — final clean. `npm run build` 2× — clean. Live Playwright browser walkthrough of all 9 personas run 2× against a dev server deliberately started on a port that doesn't match `.env`'s `APP_URL`, specifically to re-exercise the CSP/image bug under the exact mismatch condition that caused it — 0 CSP violations confirmed across every public page. Targeted re-verification of the gallery (3 thumbnails, relative image URL, property #26), the Filament panel language switcher (locale change confirmed to persist across navigation, not just a one-off query param), and the search-filter regression risk (both `for_sale`/`for_rent` return real non-zero, distinct result counts).
+
+**Verdict: READY.** Nothing left in scope for this pass is a demo blocker. Deferred items (accessibility label associations, dead-code cleanup, `PermissionsSeeder` runtime, JS bundle size, broader SEO polish) are documented and none surfaced as live errors during verification.
+
+**Next:** production deployment is a separate gate — see `docs/PRODUCTION-DEPLOYMENT.md`'s environment checklist and `docs/RELEASE-CHECKLIST.md`'s PRODUCTION DEPLOYMENT QA section before going live on a real domain.
+
+---
+
+## 2026-08-25 — Phase 15: repository release cleanup (git history, branding, security)
+
+Full audit and cleanup so this codebase can be published under Novixa's own GitHub organization without exposing the identity or git provenance of the upstream Liberu Real Estate project it was originally cloned from. Full detail in `docs/REPOSITORY_RELEASE_AUDIT.md`; item-by-item list in `docs/AQAR_TASKS.md` Phase 15.
+
+**Git history strategy (Option B, per the task's own stated preference given substantial upstream history/authors/tags):** rebuilt history from a clean orphan root rather than editing hundreds of non-Aqar-authored commits in place. Authorship analysis first confirmed all 107 commits unique to `feature/aqar-productization` were 100% `ak01redwan`-authored, with zero upstream authorship mixed in — `merge-base(feature/aqar-productization, main)` was the exact split point. Three archive branches (`archive/pre-cleanup-full-history`, `archive/upstream-liberu-main`, `archive/upstream-worktree-agent`) were created *before* any destructive step, preserving full original state locally. The 107 real commits were then replayed onto a fresh orphan root via `git rebase --onto`.
+
+**A second, more important discovery mid-rebuild:** the orphan root's tree still carried a git-history-only `.env.testing` (testing-only `APP_KEY`, conventional local-dev `DB_PASSWORD=root`) — exactly the secret-hygiene concern the task asked to check for. Rebuilt the root a second time excluding it, then verified via `git merge-base --is-ancestor` that no commit which ever added `.env.testing` is reachable from the final `main`/`feature/aqar-productization` history. `git diff` against the original pre-cleanup archive confirmed the rebase replayed all 107 commits' content byte-for-byte before any new Phase-15 changes were layered on top.
+
+Also completed: deleted 8 stale upstream version tags; removed the wrong `origin` remote (pointed at `liberu-real-estate/real-estate-laravel`); rewrote `README.md` in full (dropped fabricated blockchain/holographic-tour/neural-valuation/VR-design claims — already confirmed absent from the codebase by `docs/AQAR-DEMO-READINESS-AUDIT.md` — dropped wrong clone/demo URLs and a 12-repo Liberu ecosystem table; added an honest READY-FOR-DEMO/NOT-PRODUCTION-READY status section; preserved the MIT-required upstream attribution); removed `k8s/`, `install.php`, `.circleci/config.yml` (all dead and wrong-vendor); replaced the Liberu-wordmark logo with an original SVG and the stale template screenshot with a genuine live capture; rebranded remaining stray references (`docker-compose.yml` image tag, two markdown docs); added honest additive package metadata; hardened `.gitignore`.
+
+**Corrected a false premise in the originating task brief:** it asserted no `LICENSE` file existed. `LICENSE` exists and already carries the legally correct dual MIT attribution (Novixa + original Curtis Delicata/Liberu copyright) — verified directly, not modified.
+
+**Regression found and fixed during Part-16 final validation:** the first clean test run against the rebuilt history returned 449 failed / 136 passed — a severe drop from the 553/0/32 baseline. Root cause: a Phase-4 migration (`2026_08_25_000001_make_buyers_email_nullable.php`) used a raw `ALTER TABLE ... MODIFY` statement — valid MySQL, but invalid SQLite syntax, and the test suite runs against in-memory SQLite per `phpunit.xml`. This had been invisible to prior live-browser QA because those passes only ever exercised the real MySQL dev database. Fixed by switching to `Schema::table()->change()`, the same portable pattern already used successfully elsewhere in the same migrations directory — the original migration's "avoid a new doctrine/dbal dependency" rationale for using raw SQL didn't hold, since doctrine/dbal was already a resolved dependency. Suite re-verified back at the exact 553/0/32 baseline; `migrate:fresh --seed --force` independently re-verified clean (exit 0) against the real MySQL dev database.
+
+**Verdict: repository is safe to push to a Novixa-owned GitHub remote.** Nothing was pushed anywhere during this pass — all git surgery happened in the local clone only. A short list of GitHub-side actions that require human access (creating the real repo, adding two documented CI secrets, branch protection, visibility, and a decision on whether to publish the local-only `archive/*` branches) is in `docs/REPOSITORY_RELEASE_AUDIT.md` §9.
+
+---
+
+## 2026-08-25/26 — Phase 16: final documentation refactor and GitHub publication
+
+Final pass: reorganized documentation for a public-facing repository, one more hygiene sweep, and actual publication to `https://github.com/Novixa-dev/novixa-aqar.git`. Full detail: `docs/REPOSITORY_RELEASE_AUDIT.md` §14; item list: `docs/AQAR_TASKS.md` Phase 16.
+
+Moved 6 loose root-level feature docs into `docs/`; archived 8 dated, point-in-time audit/QA reports into a new `docs/archive/2026-08-rescue-qa-history/` (one of them, the original execution plan, was still claiming "Phase 1, in progress" from 2026-08-20 despite the project having since completed 14 more phases — actively misleading if left in the active docs tree). Added `docs/README.md` as a categorized documentation index. Fixed every cross-reference in currently-active documents to the files that moved, then ran a full repository-wide broken-link scan and confirmed zero broken links remain outside the pre-existing, pre-this-effort `docs/archive/2026-02-pre-rescue/` documents (which used local absolute-path citations that were never portable to begin with). Corrected `CLAUDE.md`'s stale "558 passed" baseline to the actual, repeatedly-verified 553/0/32.
+
+**A genuinely important finding, caught only by looking at GitHub's own file-tree view after the first push — not by any terminal-based grep, since nothing about these files was syntactically wrong.** `scratch/` (14 tracked files) turned out to be a directory of ad-hoc debugging scripts from earlier development sessions (`check_admin_roles.php`, `dump_admin_panel.php`, `test_session_middleware.php`, etc.) — exactly the "looks like a development workspace, not a maintained product" failure this entire cleanup effort exists to prevent, and something no prior pass's `git grep` for vendor-identity strings would ever have surfaced, because there was nothing wrong with the *content* of those files, only their *presence*. Separately, `.docker/supervisord.reverb.conf.1` turned out to be the raw scraped HTML of a GitHub page for an unrelated open-source project, not a config file at all, and `.docker/config/` (8 files, including an accidental nested `config/config/` duplicate) was confirmed entirely unreferenced by the Dockerfile or docker-compose. All three were removed and pushed as an immediate follow-up commit within minutes of the first push.
+
+**Lesson for future passes:** a repository "identity" audit that only searches file *contents* for bad strings is not sufficient — it's also necessary to actually look at the resulting file *tree* the way a human visitor would, since dev-workspace debris and dead infrastructure config don't announce themselves via any recognizable text pattern.
+
+**Publication:** `origin` added as `https://github.com/Novixa-dev/novixa-aqar.git` (confirmed genuinely empty via `git ls-remote` before pushing — no conflicting GitHub-generated README to worry about). `main` pushed and independently verified via `git ls-remote`/`gh api` to be the *only* ref published — no `archive/*` branches, no `feature/aqar-productization`, no tags. GitHub's own Dependabot automatically opened 3 `dependabot/github_actions/...` branches immediately upon seeing the pushed `.github/dependabot.yml` — expected platform behavior, not something this session pushed.
+
+**One item honestly flagged rather than silently skipped:** `migrate:fresh --seed` was not re-run in this final pass — the local MySQL service (managed by the Herd desktop app) went down partway through the session, and the Herd GUI could not be relaunched from this non-interactive session (most likely Windows session-isolation — the app process appears and disappears without ever binding MySQL's port). No PHP/migration/seeder code changed between the last **successful** run of that command (documented in §12 of the same report, exit 0, all migrations/seeders `DONE`) and this final state — only documentation, `.gitignore`, and the `scratch/`/`.docker/config/` removal touched anything, none of it database-layer — so that earlier result is treated as still valid, but the gap is recorded rather than papered over.
+
+**Verdict: READY FOR GITHUB / STAGING.** The repository is live at `https://github.com/Novixa-dev/novixa-aqar.git` (`main` only), passes full validation (553/0/32 tests, clean build), and no longer carries dev-workspace artifacts or dead infrastructure config. Manual-only GitHub-side items (visibility, branch protection, CI secrets, Dependabot PR triage) remain, listed in `docs/REPOSITORY_RELEASE_AUDIT.md` §14.6.
+
+---
+
+## 2026-08-28 — Phase 17: skill-assisted UI/UX, responsive, and translation-bug pass
+
+Team-lead-style deploy-readiness review requested by the user: install real design/UX skills, browse and test the live site primarily in Arabic across mobile/tablet/desktop, review translations, and fix anything found. Full detail: `docs/FINAL_PRE_DEPLOYMENT_AUDIT_REPORT.md` Addendum (2026-08-28); item list: `docs/AQAR_TASKS.md` Phase 17.
+
+Installed `ui-ux-pro-max` (the user's specifically-named skill, via its documented `npm install -g ui-ux-pro-max-cli && uipro init --ai claude` installer) and manually authored a `design-review` skill based on `jezweb/claude-skills`. Both, plus five unused bundled packages, live under `.claude/skills/` (173 files, ~4.5 MB) — decided **not** to commit these: they're local Claude Code tooling reproducible via the two documented commands, not application source, so `.claude/` was added to `.gitignore` alongside the pre-existing `.vscode/`/`.idea/` entries.
+
+Responsive review (375/768/1440px, both RTL and LTR spot-checked) across every public page plus the Staff Filament panel found no layout defects — the site's responsive foundation, already built in earlier phases, held up cleanly. The design-quality pass likewise found no fix-now visual-polish issues; every concrete defect found this pass turned out to be functional or translation-related, not cosmetic:
+
+**Filament/Staff panel:** the Staff dashboard was showing the same four headline stats twice (a proper header widget plus a redundant, differently-scoped hand-rolled Blade grid — the two blocks could show different numbers under the same labels); two widget headings/legends were hardcoded English; a fake, never-customized Filament scaffold widget ("Unique views 192.1k") was wired into the Admin panel's widget list, reachable by one future config change even though not currently rendered anywhere. Separately, `Transaction::count()` was genuinely 0 against the seeded data, so Total Revenue/Recent Transactions/the performance chart all looked broken — the chart specifically was *also* independently investigated as a possible second bug and confirmed to be a screenshot-methodology false positive (Filament's `x-load` only lazy-loads `chart.js` on real viewport-intersection scrolling, which a `fullPage` Playwright capture doesn't reliably trigger the way genuine incremental scrolling does).
+
+**Contractor dashboard** was worse than any of the above: every stat card was blank, not even showing "0", because `mount()` had every line commented out — it referenced an `App\Models\Job` class that doesn't exist anywhere in this codebase. The panel was actually built around `MaintenanceRequest`, with a working, already-established `contractor_id`-via-email lookup pattern sitting one file away in `MaintenanceRequestResource`. Rewrote `mount()` to use that real pattern.
+
+**The most consequential single finding:** `property_type` turned out to have two entirely independent, mismatched vocabularies in this codebase — the Staff edit form's dropdown offered 4 lowercase values (`house/apartment/condo/townhouse`), while `PropertySeeder`/`LeadAndBuyerSeeder` actually populate a completely different, capitalized 7-value set (`Apartment/house/Land/Commercial/Building/Villa/HMO`). Only one value happened to match. This meant editing almost any real property in the Staff panel showed a blank type selector, and the properties table displayed raw, inconsistently-cased English regardless of locale. The *same* casing mismatch (`'House'` vs. the real `'house'`) independently broke the **public-facing** `Property::translated_type` model accessor — used by the homepage, properties list, and property detail page simultaneously — meaning a real site visitor browsing in Arabic would see "house" in plain English mixed into an otherwise fully localized page. Fixed both (the Staff form against the real 7-value vocabulary; the model accessor's one wrong key), and separately discovered and fixed two both-filters-are-visible-but-non-functional `SelectFilter`s (`property_type`, `status`) that had never had `->options()` set.
+
+**A genuinely interesting one-off:** the floor-plan image upload field (a hand-rolled Alpine component, unlike every other upload field on the same form which use Filament's own styled `FileUpload`) showed the browser's raw, unstyled, English "No file chosen / Choose File" text. Fixing it — hiding the native input behind a styled, translated `<label>` — surfaced two more lessons worth remembering for future work on this codebase: (1) injecting a JS string literal into a `<script>` block via Blade's escaping `{{ }}` turns apostrophes into `&#039;` and silently breaks the *entire* surrounding Alpine component with a `SyntaxError`, not just the new code (caught live via console-error inspection before being called done, fixed with `{!! !!}` since both branches were safe hardcoded literals); and (2) a Blade-only edit that introduces a Tailwind utility-class combination not already used elsewhere in a Filament panel's scanned templates has **zero visual effect** until the panel's theme CSS is rebuilt (`npm run build`) — Tailwind v4 scans at build time, not request time, and no `npm run dev` process was running. Confirmed via computed-style inspection, not assumed.
+
+**Also found and fixed:** the Socialstream login/register divider ("Or Login Via") rendered empty with zero buttons beneath it, because the outer wrapper only checked the package's `show()` enabled-flag rather than whether any OAuth provider is actually configured; one of five seeded news articles was entirely in English while the rest of the demo dataset (and the surrounding UI) is Arabic; the news detail page's dates were raw ISO strings while the list page already correctly localized the same field; and the property detail page's "Category" badge printed a raw, untranslated value — including literally the word "test" on one seeded property, traced to genuine leftover dev-database cruft (a `PropertyCategory` row no seeder ever creates) rather than a code bug, fixed by reassigning that property to its correct category and deleting the orphaned row.
+
+**Deliberately not treated as bugs:** Property and News content (titles/descriptions/article bodies) don't translate on locale switch, because those tables have no per-locale columns — every visitor sees whatever language a given row was authored in. Confirmed this is consistent even for the English-locale spot-check (UI chrome switches correctly to `dir=ltr`; content stays Arabic). Given this project's explicit Yemen-first, Arabic-primary identity, this reads as a deliberate content-authoring reality, not something to rework into a full per-locale schema during a fix-what's-broken pass.
+
+**Validation:** `php artisan test --no-ansi` run twice this pass, both **553 passed / 0 failed / 32 skipped (2135 assertions)** — exact match to the established baseline, no test weakened or deleted.
+
+**Scope note, flagged rather than silently dropped:** the plan called for a fourth (1920×1080) viewport; only 375/768/1440 were actually captured.
+
+**Verdict: DEMO READY** (restated on this pass's own evidence). No push to `origin` yet — awaiting the user's separate go-ahead, per this project's established convention.
+
+---
+
+## 2026-08-28 — Phase 18: final demo release gate
+
+The user asked for one last, explicit gate before pushing: verify the exact code about to be published is the same code just declared DEMO READY. Full detail: `docs/FINAL_PRE_DEPLOYMENT_AUDIT_REPORT.md` Addendum B; item list: `docs/AQAR_TASKS.md` Phase 18.
+
+This gate is what registration and password reset had not been — the previous pass verified translations, layout, and widget data extensively but never actually walked a brand-new visitor through signing up. Doing so this time found the single most severe bug of the entire multi-day effort: **self-registration was completely broken.** A visitor filling out `/app/register` got a real account, got logged in — and was then immediately served a hard 403 on the very panel they'd just joined, because the authorization gate for that panel required a role no self-registered user could ever have. Every other check this project has run (the 219-route sweep, the 553-test suite, five separate browser-QA passes) had exercised *already-authenticated seeded personas*, never a fresh signup — which is exactly why this had gone unnoticed until a gate specifically asked "can a new person actually join."
+
+Fixed narrowly: roleless users get into the general "App" panel; anyone who already holds one of the 8 persona roles keeps the exact restricted behavior a pre-existing test already encoded. That test — `PanelSwitcherTest::test_buyer_sees_no_switch_links` — is what caught the first version of the fix being too broad, within the same session, before it was ever called done. This is the process working as intended: the full suite was run again specifically *because* a fix had just landed, not skipped as "probably fine."
+
+Also found and fixed: a CSP gap silently blocking file-upload preview thumbnails and a upload-related Web Worker (the upload itself always worked; only the client-side feedback was blocked — caught via live console inspection, not assumed from the network tab alone), and five panels' Dashboard pages plus the entire Tenant widget area still showing raw English, missed by the previous pass's screenshot-driven review because titles and some widget labels don't show up distinctly in a full-page capture the way layout problems do.
+
+One test (`TransactionTest::test_transaction_scope`) failed once across four full-suite runs this pass, against identical code both times. Investigated rather than dismissed: isolated re-runs and a forced reproduction of the specific suspected leak path (seeding `DemoWorkflowSeeder` immediately before this test, since that seeder gained two new rows this week) both came back clean. Logged as a likely pre-existing flake, explicitly not claimed as fixed or explained away.
+
+Ran a genuinely fresh `migrate:fresh --seed --force` this pass (not just a targeted re-seed) — confirmed exit 0, and confirmed the previous pass's fixes (transaction seeding, the translated news article) hold from a cold start, and that the "test" property category — cleaned up live last time — does not come back, since no seeder path ever produced it.
+
+**Verdict: DEMO READY.** Nothing pushed. 15 commits ahead of `origin/main`, 0 behind, clean fast-forward available.
+
+---
+
+## 2026-09-02 to 2026-09-08 — Phase 19: first real deployment (Railway staging), OOM crash-loop, and a missing production dependency
+
+The code from Phase 18 was pushed to `main` and a real deployment was stood up: `novixa-aqar-staging` on Railway — a `web` service (1GB memory / 2vCPU) plus managed MySQL, deployed from this repo's `Dockerfile` (Octane/RoadRunner + supervisor). Full item-by-item detail: `docs/AQAR_TASKS.md` Phase 19.
+
+**The first deploy attempt (2026-09-02) never actually served a single request.** Octane's default worker count (one per CPU core) plus opcache overhead sat right at the container's 1GB ceiling; the kernel OOM-killer repeatedly SIGKILLed the octane process, and orphaned RoadRunner workers kept holding port 8000 across restarts until supervisor gave up. Railway's own dashboard showed the deployment as "SUCCESS" the entire time — the container process itself never exited, it just sat dead — which meant this went unnoticed for **42+ hours** before anything (unclear what — possibly a Railway-side host event) finally reaped the orphaned processes. A prior session diagnosed the crash loop via Railway's deploy logs and memory metrics (confirmed usage pinned at 83% average / 100% max of the 1GB limit) and began drafting a fix; independently, a teammate (Salem) reached the same root cause and pushed a working fix directly to `main` on 2026-09-04 (`--workers=1`, opcache disabled entirely rather than just lowered — safer, since a SIGKILLed process isn't guaranteed to release opcache's shared-memory segment cleanly). **Verified stable for 4 consecutive days after**: memory steady around 0.2GB/1GB, zero further crashes, confirmed via Railway's own metrics API — the standing lesson here (worth restating): a platform's "SUCCESS" deploy status means the build and container start succeeded, not that the application is actually serving traffic. Always check runtime logs and resource metrics, not just deploy status.
+
+**On top of the now-stable base, a follow-up session added two hygiene fixes** (`b142def`): a defensive `fuser -k -n tcp 8000` before every boot, so a future transient crash can't wedge the container for hours the same way again; and decoupled `migrate` (always runs) from `db:seed` (only runs when `RUNNING_MIGRATIONS_AND_SEEDERS=true`) in `start-container`, since they were previously gated together — meaning turning off the one-time seed flag post-bootstrap (the documented correct behavior) would have silently stopped future migrations from ever running too.
+
+**The more consequential finding, surfaced while verifying the deploy actually worked end-to-end rather than trusting "the crash is fixed" as "the deploy is done": the demo has had zero properties and most of its reference/demo data missing since its very first successful boot.** `PropertySeeder` calls `Faker\Factory::create()` directly, but `fakerphp/faker` was declared only in `require-dev` — `composer install --no-dev` (what the Dockerfile actually runs) strips it from the deployed image, so the first line of `PropertySeeder::run()` fatally errors with `Class "Faker\Factory" not found`. Confirmed via the 2026-09-04 deploy logs: every seeder before `PropertySeeder` in `DatabaseSeeder`'s chain completed successfully (`SiteSettingsSeeder` through `NeighborhoodSeeder`), then the uncaught exception silently aborted everything after it too — `LeadAndBuyerSeeder`, `AppointmentTypeSeeder`, `MenuSeeder`, `DocumentTemplateSeeder`, `ComponentSettingsSeeder`, `NewsSeeder`, `DemoWorkflowSeeder` never ran on either of the two seed attempts that boot made. Fixed by moving `fakerphp/faker` to `require` (`3ef3ed9`) — verified re-seeding is safe first, by reading every earlier seeder in the chain to confirm each is idempotent (`updateOrInsert`/`firstOrCreate`), so nothing will duplicate on the next successful seed run.
+
+**Opened and merged `Novixa-dev/novixa-aqar#11`** with both fixes, on top of `main`.
+
+**Also found, deliberately not acted on:** Railway's dashboard showed ~30 staged (undeployed) environment-variable/config changes on the `web` service whose origin and content were not visible via the API (values redacted). Left untouched rather than guessed at — flagged for the project owner to review directly in Railway. **Still unresolved as of Phase 20 below** — carry this forward before trusting the full Railway variable set.
+
+**Verdict at the time:** not yet verified that a redeploy with the Faker fix actually completes the full seed chain and the live site shows real seeded content — that verification is Phase 20's job below.
+
+---
+
+## 2026-09-09 — Phase 20: full demo-data completion pass + Railway staging deployment prep
+
+**Context:** this pass started from a `feature/aqar-productization` branch that was 9 commits behind `origin/main` (missing the Phase 19 OOM fixes above) — pulled clean, no conflicts, before starting. Confirms the actual deployment target is Railway, not the Laravel Cloud plan `docs/DEPLOYMENT-ENVIRONMENT-INVENTORY.md` was written against — logged in `docs/AQAR_DECISIONS.md`. Partway through this pass, `origin/main` advanced again with Phase 19's `#11` merge (the Faker fix above) — merged into this branch before pushing, see the conflict-resolution note in `docs/AQAR_DECISIONS.md`.
+
+**Task:** the user asked for every panel/page/section to carry real-looking demo data — nothing empty — so a reviewer clicking through the live demo never hits a blank table or empty state, then to get that data live on the Railway staging environment.
+
+**Method — verified against a real seeded database, not static code reading alone.** An initial grep-based audit found several apparent gaps; cross-checking against actual row counts from a fresh `migrate:fresh --seed --force` caught **two false positives** the static pass would have wasted effort on: `Room` (24 rows — already created inside `PropertySeeder::createHmoProperties()` via `$property->rooms()->create()`, a relationship call `grep "Room::"` doesn't match) and `PropertyHistory` (28→48 rows — auto-populated by `PropertyObserver::created()` on every seeded property with a `list_date`, then enriched by the newly-wired `PropertyHistorySeeder`). `Branch` was likewise already non-empty (1 row, auto-created alongside the demo team) and was left alone rather than wiring in the standalone `BranchSeeder.php`, which has no dedup guard and would have created a redundant second branch.
+
+**Genuine gaps found and fixed** (verified empty via real counts, not just grep):
+
+| Model | Before → After | Fix |
+|---|---|---|
+| `PropertyFeature` | 0 → 140 | New `DemoDataCompletionSeeder`: 4-6 realistic Arabic amenities per property, deterministic by id |
+| `Review` | 0 → 10 | Property + neighborhood reviews, tied to personas who plausibly interacted (buyer's bookings, tenant's lease); `approved => true` set explicitly — confirmed via `PropertyDetail.php:78` that the public page only renders `approved` reviews; one deliberately `pending` for a non-empty moderation queue |
+| `CommunityEvent` | 0 → 30 | Wired the pre-existing, previously-unwired `CommunityEventSeeder` into `DatabaseSeeder` |
+| `Favorite` | 0 → 6 | Buyer/tenant sample favorites so the Wishlist page isn't empty |
+| `KeyLocation`, `PropertyTemplate`, `EmailCampaign` | 0 → 3 each | Staff-panel resources that had zero backing rows |
+| `EnergyConsumption` / `UtilityPayment` | 0 → 4 / 0 → 2 | Linked consumption + payment records for a handful of rented properties |
+| `Message` (Communication Hub, Staff+Tenant panels) | 0 → 4 | A short realistic staff↔tenant and landlord↔staff thread |
+| `ChatConversation` / `ChatMessage` | 0 → 3 / 0 → 7 | Three sample chatbot conversations (closed/active/escalated), one genuinely anonymous (`user_id => null`) |
+| `ContactMessage` | 0 → 4 | Sample inbound public contact-form submissions, mixed read/unread |
+| `Tenant` / `MaintenanceRequest` / `Booking` / `Transaction` / `RentalApplication` | 3/4/3/2/3 → 7/9/6/4/6 | `DemoWorkflowSeeder`'s existing volumes enriched (more `take()`, more seed rows) so panels read as an active agency rather than a bare fixture set |
+| `Property.moderation_status` | all `NULL` → mixed (2 approved, 2 pending, 1 rejected, rest approved) | So the Staff "Property Moderation" resource shows an active-looking workflow instead of a uniformly blank column. Verified this has zero effect on public visibility — no public query filters by `moderation_status`, confirmed via a full grep before making the change |
+
+**A real bug caught mid-pass:** the first version of `DemoDataCompletionSeeder` authored 3 of its reviews (2 generic + 1 pending) against `appuser@darhadhramaut.ye` — a persona referenced defensively elsewhere in `DemoWorkflowSeeder` but which, verified via `User::pluck('email')` on a fresh seed, **does not actually exist** in `UserSeeder`'s output (only the 8 documented role personas do). The `if ($appUser)` guard meant this failed silently rather than crashing, but it silently dropped 3 rows. Fixed by re-targeting that content at real, always-present personas (`buyer`, `tenant`) instead of a persona that has never been seeded.
+
+**Verification performed:**
+- `php artisan migrate:fresh --seed --force` — 4 runs this pass. One failed with a transient Windows file-permission error writing the Spatie permission cache (`storage/framework/cache/data/...`, unrelated to any seeder code — confirmed by an immediate clean retry succeeding); the other three exited 0. Final row counts confirmed via a direct tinker script against the live database, not just the seeders' own summary line.
+- `php artisan test --no-ansi` — **553 passed / 0 failed / 32 skipped (2135 assertions)**, exact match to the established baseline. Zero regressions from any of the above.
+- Deleted `database/seeders/UKASTTemplateSeeder.php` — a pre-existing, completely empty (0-byte) seeder file, unreferenced anywhere in the codebase or tests (confirmed via project-wide grep before deleting).
+
+**Staging deployment prep:** `docs/STAGING_DEMO_DEPLOYMENT_PROMPT.md` (written this session) documents the full Railway environment-variable matrix, the one-time `RUNNING_MIGRATIONS_AND_SEEDERS=true` full-reseed step, and a post-deploy verification checklist. Railway CLI installed locally (`@railway/cli` via npm) ready for the deploy step, pending a `RAILWAY_TOKEN` from the user to authenticate against the actual project.
+
+**Verdict: FULL DEMO DATA READY (locally).** Every panel/page audited against real seeded row counts (not assumed) now has non-empty, realistic content. Merged with Phase 19's Faker fix before pushing (see `docs/AQAR_DECISIONS.md`) — the two passes are complementary: Phase 19 made the live Railway seed chain able to complete at all; this phase makes what it seeds actually full. Not yet redeployed to Railway as of this entry — see `docs/STAGING_DEMO_DEPLOYMENT_PROMPT.md` for the exact remaining steps and required input (a `RAILWAY_TOKEN`).
+
+---
+
+## 2026-09-09 — Phase 21: full priority-ordered QA sweep + 10 real bugs found and fixed
+
+**Context:** by this point Railway hosting was already live (project `novixa-aqar-staging`, `web` +
+`mysql` services, auto-deploy from `main` confirmed working) and full of seed data (Phase 20). The
+user asked for a professional, priority-ordered ("من الاهم فالاهم") full QA pass across every
+role/panel/language/screen size, with every finding logged and a final comprehensive `.md` report.
+Full detail: `docs/AQAR_QA_REPORT_2026-09-09.md`.
+
+**Environment note:** this session's sandbox has a hard network-policy block on the live Railway URL
+(confirmed via two tools + the proxy's own status endpoint) — correctly not routed around. Worked
+around by standing up the exact same commit locally (fresh MariaDB, `migrate:fresh --seed`,
+`php artisan serve`) and running real Playwright browser sessions against it — the identical
+local-serve+Playwright pattern this project's QA history has used in every prior phase. Deploy-side
+operations (merging PRs, setting Railway variables, reading deploy logs) went through Railway's
+management API, a separate channel that was reachable throughout.
+
+**Test results:** Tier P0 10/10 PASS (homepage, self-registration, all 9 persona logins). Tier P1
+panel sweep: 107/109 PASS across a full nav-discovery-and-visit of every persona's sidebar (not a
+hand-picked subset) — 37 admin pages, 34 staff, plus agent/buyer/seller/landlord/tenant/contractor.
+Full live-browser CRUD lifecycle verified on Properties (create → search → edit → delete), including
+confirming the staff-vs-admin delete-permission boundary is enforced correctly both in policy and in
+what the UI renders. Public site: property browse/detail, calculators (real YER-denominated
+interactive tool), contact form (verified a **real DB row** was created, not just a UI success
+message), news, and the chatbot (sent a real Arabic message, got a real contextual reply). Tier P2:
+English locale (zero raw keys, correct RTL→LTR icon mirroring), dark mode on `/login` (regression
+check on the historical P13-6 gap — still fixed), and 375/768/1440px responsive (zero horizontal
+overflow at any breakpoint).
+
+**10 real bugs found and fixed, all via live reproduction before any fix was written:**
+
+1. **`ChatConversationResource` — 100%-reproducible HTTP 500** on `/admin/chat-conversations` and
+   `/staff/chat-conversations`. Root cause: the `escalated_at` column chained
+   `->dateTime()->default('—')` — Filament's `default()` substitutes the literal string as the
+   column's state when null, which `dateTime()`'s Carbon parser then chokes on. Fixed by switching to
+   `->placeholder('—')` (verified against Filament's own source that `blank($state)` short-circuits
+   *before* parsing). Re-verified live: HTTP 200, all 3 seeded conversations render correctly.
+2. **`ContactMessagePolicy` — missing, authorization fails open.** Of 35 Resource-backed models, 2 had
+   no Policy class; `Alert` is confirmed dead code, but `ContactMessage` is genuinely reachable in the
+   live Admin panel. Non-strict Filament auth + no policy = fails open: any Admin-panel-eligible role
+   (staff included) could view public contact-form PII, directly contradicting `RolesSeeder`'s own
+   `matchesStaffAllowlist()`, which deliberately excludes `contact_message`. Fixed by adding the
+   policy (auto-discovered, no explicit registration needed — this project relies on Laravel's
+   model-name convention). Verified via tinker: staff denied, admin still allowed, exactly matching
+   the seeder's stated intent.
+3. **`RESEED_FRESH` crash-loop on Railway** — found *while executing the cleanup Phase 20/21's own
+   `PropertySeeder` idempotency fix made necessary* (using the new `RESEED_FRESH=true` flag to clear
+   out already-duplicated live property rows). Railway's deploy logs showed `migrate:fresh --seed`
+   crash-looping: repeated attempts threw `Spatie\MediaLibrary\...\DiskCannotBeAccessed`
+   inside `ResponsiveImageGenerator`, reached inline (via `QUEUE_CONNECTION=sync`) from
+   `PropertySeeder::attachGalleryPhotos()`. `start-container`'s `RESEED_FRESH` branch has no `|| true`
+   fallback, so each crash aborted the whole container boot and Railway auto-restarted it, re-running
+   the entire fresh reseed from scratch each time.
+   **First fix attempt (PR #17) merged but turned out ineffective** — `->withResponsiveImagesIf(false)`
+   on the seeder's `addMedia()` call verified clean locally and merged, but the identical crash
+   happened again on the very next live redeploy, at the identical line. Caught only by watching that
+   redeploy through to completion via Railway's own logs rather than trusting "verified locally,
+   merged" as sufficient. Root-caused properly this time: Spatie's `FileAdder::processMediaItem()`
+   unconditionally calls `checkGenerateResponsiveImages()`, which re-derives the responsive-images
+   flag from the *media collection's own* registered default and silently overrides any per-call
+   override — there is no way to opt out at the `addMedia()` call site once the collection itself has
+   responsive images enabled, only the collection registration is authoritative.
+   **Fix, part 1 (PR #18)**: added `Property::$skipResponsiveImagesForSeeding`, an instance property
+   checked inside `registerMediaCollections()` itself — the one place in the chain that actually
+   sticks, since that method is re-invoked fresh on the specific model instance every time. Real user
+   uploads via Filament are unaffected (flag defaults `false`). Verified locally: clean single-pass
+   `migrate:fresh --seed --force`, `PropertySeeder` now 607ms (was 75,990ms even when it happened not
+   to crash), 28/28 properties with photos, and a sample media row's `responsive_images` field
+   genuinely empty (`[]`). Merged — **but the crash-loop continued on the next live redeploy anyway.**
+   The stack trace had changed (no longer through `ResponsiveImageGenerator` — proof this fix genuinely
+   worked), now failing on the *base* media file copy instead: checked Railway's `DISK_USAGE_GB`
+   metric and found the 500MB persistent volume at ~504MB used — completely full. `migrate:fresh` only
+   ever resets the database, never the filesystem, so every earlier crashed/partial attempt across this
+   whole investigation had left orphaned property photos on the volume with nothing ever cleaning them
+   up, until it filled completely.
+   **Fix, part 2 (PR #19)**: clear `storage/app/public` before `migrate:fresh --seed` in the
+   `RESEED_FRESH` branch, so the flag's own "clean slate" promise covers the filesystem too. Merged,
+   redeployed, and this time verified by reading the complete deploy log rather than trusting an early
+   status: exactly 1 container boot, full seed chain completed (`PropertySeeder` 1,259ms, zero errors),
+   reached `Octane Server: roadrunner` with a running process. `DISK_USAGE_GB` confirmed back to a
+   healthy ~70MB. `RESEED_FRESH` then set back to `false` — that redeploy's own log confirmed the
+   normal ("Nothing to migrate") boot path, admin ensured, `storage:link` connected, server started
+   cleanly. **Fully resolved and live-verified as of this entry.**
+4. *(Carried from the same investigation, Phase 20/21 boundary)* **`PropertySeeder`
+   non-idempotency** — every re-seed created 28 brand-new duplicate properties; live Railway logs
+   showed 560 `property_features` rows where 140 was expected (exactly 4×). Fixed via a
+   `Property::exists()` guard.
+5. **Property-viewing booking feature — 100% broken, 2 stacked crashes.** Found executing Tier P1
+   item 19 (booking/viewing scheduling): `/properties/{id}/book` returned HTTP 500 for every
+   user/property. Bug A: `routes/web.php`'s route parameter was named `property` but
+   `App\Livewire\PropertyBooking::mount($propertyId)` expects `propertyId` — Livewire full-page route
+   binding matches by name, so this threw `Unable to resolve dependency` on every load. Bug B (only
+   reachable once A was fixed): `bookViewing()`'s submit handler called the nonexistent
+   `Property::getAvailableDates()` instead of the real method `getAvailableDatesForTeam()` already
+   used a few lines above in `mount()` — every submission failed with a generic "unexpected error."
+   Fixed both; verified end-to-end as `buyer@darhadhramaut.ye` (real confirmation with working
+   calendar links, and `tinker` confirmed a real `bookings` row persisted). Also noted, not fixed: the
+   route has no UI entry point anywhere — a product decision for the owner, out of scope here.
+6. **AI investment analysis — silently failing on every property page.** Found while re-verifying
+   property pages right after the booking fix: `storage/logs/laravel.log` showed
+   `Table 'aqar.saved_searches' doesn't exist` on every single `/properties/{id}` view, caught and
+   swallowed by `AIInvestmentAnalysisService::analyzeProperty()`'s own try/catch — the page always
+   rendered fine, but the real AI analysis had silently never run, on any property, ever. Root cause
+   part 1: the `SavedSearch` model and `User::savedSearches()` have always existed and are queried by
+   `PropertyRecommendationService::getSearchHistory()`, but no migration was ever written for the
+   table. Root cause part 2 (only visible once part 1 fixed): `getRecommendations()` also calls
+   `$user->activities()`, a relationship that was never defined on `User` despite `Activity` having a
+   ready `user_id` column. Fixed both; verified via `tinker` that `analyzeInvestment()` now returns a
+   full real result instead of the silent fallback, and re-confirmed via a cleared log that the error
+   never recurs on repeat visits.
+
+7. **Rental Applications — blank "Applicant" column + dead approve/reject actions (Landlord + Staff).**
+   Bound to `tenant.name`, but every seeded application links via `applicant_id`→`contacts` instead.
+   Added `RentalApplication::applicant_name`, resolving whichever relation is actually set; also
+   merged a duplicate `->filters()`/`->recordActions()` call pair in the Staff resource that had been
+   silently discarding the approve/reject quick actions and two filters. Verified via screenshots.
+8. **Tenant maintenance-request + work-order creation — 100% broken, 4 stacked crashes.** NOT NULL
+   `tenant_id` never set by the create form; NOT NULL `property_id`/`title`/`work_type`/`team_id`/
+   `created_by` never set by either work-order creation path; a `Tenant` model passed where `User` was
+   typed; and `App\Notifications\WorkOrderCreated` never existed as a class. All four fixed (form hook,
+   a model-level `booted()` default, a relation-chain correction, and a new notification class).
+   Verified end-to-end: a real request + nested work order created and persisted with every column
+   correctly populated.
+9. **Property review submission — 100% broken for every user, every property.**
+   `PropertyReviewForm::canUserReview()` called `$user->bookings()`/`rentals()`, neither of which
+   existed on `User`. Added both relationships. Verified end-to-end: a real review submitted on a
+   previously-booked property persisted correctly, and the eligibility gate itself (a real product
+   rule) now works instead of crashing.
+10. **Utility Payments / Lease relation manager — USD shown instead of YER.** Both used bare
+    `->money()` (Filament's default currency), unlike every other money column in the app. Fixed both
+    to pass the configured default currency; a codebase-wide grep confirmed no other instances.
+    Verified via screenshot.
+
+**Found, deliberately not fixed:** while auditing every call site of the notification methods
+involved in finding 8, found a second, separate maintenance-request Livewire component
+(`app/Livewire/MaintenanceRequestForm.php`) with the same class of `tenant_id`/`tenants.id` confusion
+plus a reference to a `properties.tenant_id` column that doesn't exist. Confirmed via a route/view
+grep that this component is unreachable — not embedded anywhere, not routed anywhere — so it's dead
+code with zero live impact, unlike finding 8's Filament flow. Documented in the QA report (§5.11) so
+it isn't rediscovered the hard way if a future session wires it into a view.
+
+**Commits:** `f424db0` (idempotent PropertySeeder + RESEED_FRESH), `43f96b6` (ChatConversationResource
+fix), `f46c65e` (ContactMessagePolicy) — all merged via PR #16, all 6 CI checks green, auto-deployed
+to Railway (confirmed live). `b4ae817` (responsive-images fix, first attempt) — merged via PR #17,
+later found ineffective live. `3cbbf74` (the real responsive-images fix, confirmed to have worked) —
+PR #18. `70960b7` (clear the full volume before reseeding — the actual remaining cause) — PR #19.
+All merged, redeployed, and verified via a fully-read deploy log. `ee3a017`/`6cddf16`/`54c89d9`/
+`97bc81e`/`873f0e2`/`68ffba7` — **merged via PR #21** (`1c2242b`), all 7 CI checks green,
+`mergeable_state: clean`. Redeployed to Railway (deployment `4f68988e`) and live-verified via a
+fully-read deploy log: the new `saved_searches` migration ran cleanly (`127.73ms DONE`),
+config/routes/views/Filament caches rebuilt with zero errors, RoadRunner started, supervisord
+confirmed `octane_0` reached RUNNING and stayed up — no exceptions anywhere in the log. Findings 5-10
+above are now live, not just merged.
+
+**Full reachability sweep — done, zero findings:** a Playwright crawl of every sidebar-discoverable
+link across all 8 personas (103 page visits, up to 40 per persona) with an HTTP-status listener and a
+cleared/rechecked `laravel.log` found zero HTTP 500s and zero new errors. This was the one remaining
+Tier P3 item from earlier in this phase.
+
+**Verdict:** staging demo is live, seeded, and passes every P0 check plus the large majority of
+P1/P2/P3. Zero unresolved P0s from this pass. Every Tier P1 deep-interaction item and every Tier P3
+item planned for this phase has now been exercised and verified live — findings 5-10 above cover six
+more real bugs found, fixed, merged, and confirmed live on staging, plus one confirmed-dormant defect
+documented (not fixed, since it's unreachable dead code) and a full reachability sweep confirming zero
+new errors anywhere in the app. See `docs/AQAR_QA_REPORT_2026-09-09.md` for the complete, final
+report.
+
+---
+
+## 2026-09-09 — Phase 19 close-out: remaining seeder idempotency guards, merged and live-verified
+
+Final item from the deployment phase. A sweep of `database/seeders/` for create-paths with no
+duplication guard found three still unguarded, all inside `DatabaseSeeder`'s chain, so every
+additive re-seed on deploy grew the demo dataset without bound:
+`DemoDataCompletionSeeder::seedCommunicationHub` (4 internal messages per run — confirmed live, the
+seed summary read **8** after a second run against the four that method defines),
+`CommunityEventSeeder` (30 events per run), and `PropertyHistorySeeder` (~5 timeline rows × 5
+properties per run). Guarded with `firstOrCreate` on the natural key where one exists, and with the
+same `::exists()` early-return `PropertySeeder` already uses where the rows are factory-generated or
+property-derived and have no natural key. `PropertyHistory` guards per-property rather than globally
+so a property added later still gets its timeline backfilled. Ten other seeders were audited and
+confirmed already safe. `BranchSeeder` is the only unguarded seeder left in the tree and is not
+registered in the chain, so it never runs on deploy — left alone deliberately rather than widening
+the PR.
+
+Also added `docs/AQAR_STAGING_MANUAL_QA_GUIDE_AR.md`, an Arabic hand-off document for the manual QA
+pass (current state, fix history, quick-start, the nine demo accounts with their panels, and a
+priority-ordered five-stage test plan).
+
+**Merged as PR #25** (`ca6e96b`) with all six substantive CI checks green (`tests`, `laravel-tests`,
+`Full Install Smoke Test`, `PHP Insights`, `PHP Copy/Paste Detector`, `PHP Security Checker`;
+`docker` skipped, which is normal on a PR) and `mergeable_state: clean`.
+
+**Live-verified on the resulting Railway deployment (`2bc83b59`), by reading the deploy log rather
+than trusting the deploy status** — the lesson this whole phase was built on, since Railway reported
+"SUCCESS" throughout the original 60-hour outage while the container was in fact dead: migrations
+applied cleanly ("Nothing to migrate"), admin bootstrap succeeded, the storage symlink connected,
+config/routes/views/Filament caches rebuilt with zero errors, RoadRunner started and supervisord
+confirmed `octane_0` reached RUNNING and stayed up. Resource metrics after the deploy: memory
+**0.16 GB current / 0.22 GB peak against the 1 GB limit** (this is the ceiling that was pinned at
+100% during the OOM crash-loop), disk **0.07 GB of 0.5 GB** (was 100% full during the seed-crash
+saga), CPU idle.
+
+**Steady state confirmed, not assumed:** this boot ran no seed pass at all, which is the behavioral
+proof that `RUNNING_MIGRATIONS_AND_SEEDERS` is now `false` — the documented steady state, with
+migrations still running unconditionally on every boot in their own right.
+
+**Deliberately not done:** a `RESEED_FRESH` rebuild. It runs `migrate:fresh --seed --force`, dropping
+every table and wiping the media volume, and with the guards above merged its only remaining benefit
+is cosmetic — clearing demo rows that duplicated *before* the guards existed (8 internal messages
+instead of 4, duplicate community events and property-history rows). Properties are already correct
+at 28. That is not worth a destructive wipe taken unilaterally, particularly with a manual QA pass
+about to start that it would erase; left as an explicit, documented, opt-in call for the project
+owner.
+
+---
+
+## 2026-09-10 — Phase 22: closing the structural gap that let the outage go unnoticed, and restoring opcache
+
+Earlier phases fixed *why* the app died. This one fixed *why nobody knew for 60 hours*, which is the
+more important defect.
+
+**Root cause of the silence — three things, each sufficient on its own:**
+
+1. **No HTTP healthcheck was configured on Railway.** `healthcheckPath` was unset, so the platform never
+   asked the application whether it could actually serve a request.
+2. **The application already had the endpoint.** `bootstrap/app.php:17` declares `health: '/up'` —
+   Laravel's built-in health route existed the whole time. The app could answer; the platform was never
+   told to ask.
+3. **supervisord is PID 1.** When Octane died, supervisord stayed alive, so the container never *exited*.
+   Railway saw a running container and a `SUCCESS` deployment, and had no reason to restart anything.
+
+Configured `healthcheckPath=/up`, `healthcheckTimeout=300`, `restartPolicyType=ON_FAILURE` (10 retries).
+
+**The first deploy with the healthcheck enabled FAILED — and diagnosing it produced the most reusable
+lesson of this whole effort.** The container booted perfectly (migrations clean, caches built, Octane
+`RUNNING` in ~4s), then the deploy sat for exactly 300 seconds and was marked failed. Per Railway's own
+documentation (`docs.railway.com/deployments/healthchecks`):
+
+> Railway will inject a `PORT` environment variable that your application should listen on. This
+> variable's value is also used when performing health checks on your deployments. If your application
+> doesn't listen on the `PORT` variable, **possibly due to using target ports**, you can manually set a
+> `PORT` variable to inform Railway of the port to use for health checks.
+
+That is this service exactly: the public domain uses a **target port** (→ 8000), the app listens on a
+hardcoded 8000 (`--port=8000` in `supervisord.roadrunner.conf`), and no `PORT` variable existed — so
+Railway was probing a port nothing listened on. Fixed by setting `PORT=8000`; no code change. The next
+deploy was marked `SUCCESS` **3 seconds after Octane reached RUNNING**, versus a 300-second timeout
+before — proof the probe now finds the app immediately.
+
+**An important limit, recorded so it is not over-claimed.** The same documentation states the healthcheck
+is called only at the start of a deployment and is explicitly *not* used for continuous monitoring. It
+therefore protects against exactly the failure mode that produced a false `SUCCESS` (a deployment that
+never serves) but will **not** catch an app that dies hours after a healthy deploy — which is what
+actually happened on 2026-09-02. **Continuous uptime monitoring remains an open gap** requiring an
+external monitor; it is not solved by this change.
+
+**Also verified as a real benefit:** the failed deploy did not replace the running one. Railway's
+documented behaviour — "the deploy is marked failed and the previous deployment keeps serving traffic" —
+means a broken build can no longer silently take over the demo. Before this, it would have.
+
+**opcache re-enabled** (PR #27). It was disabled during the OOM incident because a shared-memory segment
+is not guaranteed to be released on SIGKILL, which mattered in a once-per-second crash loop. That
+condition is gone (workers pinned to 1, memory flat for days), while the cost of leaving it off was
+user-visible: PHP recompiled every file on every request. Sized conservatively at 64M bytecode + 8M
+interned strings; CLI off, JIT off, `file_cache` deliberately unset (its missing directory was what
+fatally errored on every PHP invocation on a fresh container).
+
+**Live verification of deployment `73579c90`, read from logs and metrics rather than deploy status:**
+storage symlink connected, all seven caches rebuilt with zero errors, RoadRunner started, `octane_0`
+entered RUNNING and stayed. Memory **0.214 GB of the 1 GB limit** — matching the predicted ~70MB rise
+from the 0.15 GB baseline almost exactly, and nowhere near the ceiling that caused the original OOM.
+Disk 0.07 GB of 0.5 GB.
+
+**Deliberately not done, with reasons:**
+- **`accept-deploy` on the stale staged patch** (dated 2026-09-02T00:15, the project's creation moment).
+  It carries wanted volume-usage alerts at 80/95/100%, but its diff renders every service variable as
+  `removed` — `APP_KEY` among them. Losing that key invalidates every session and makes encrypted
+  `LeaseAgreement.content` unreadable (`docs/PRODUCTION-DEPLOYMENT.md` §1). Monitoring alerts do not
+  justify that risk on a working demo; set them from the Railway dashboard instead. This also resolves
+  the "~30 staged changes, origin unknown" item carried forward from an earlier phase: the patch is
+  vestigial from project creation, not someone's pending edit.
+- **`RESEED_FRESH`** — still destructive and its only remaining benefit is cosmetic now that the seeders
+  are idempotent.
+- **`checkSuites` is still `false`**, so a push to `main` deploys without waiting for CI. The MCP
+  `update-service` tool does not expose source settings; this needs the Railway dashboard.
+
+---
+
+## 2026-09-11 — Phase 23: wiring the external services the demo actually depends on
+
+**PR #29.** The app was full of integrations that were fully written but not actually connected.
+Files lived on the container's own disk, no mail ever left the process, and several services read
+configuration keys that did not exist — so they received `null`, constructed themselves
+misconfigured, and failed much later at a point that said nothing about the cause.
+
+Plan and decisions: `docs/AQAR_EXTERNAL_SERVICES_PLAN_AR.md`.
+Service/credential map: `docs/AQAR_KEYS_AND_SERVICES_AR.md`.
+Manual pass: `docs/AQAR_BROWSER_TEST_PLAN_AR.md`.
+
+### Storage — moved to S3-compatible object storage
+
+Property photos and uploaded documents now live in a Railway Storage Bucket (`aqar-media`, `ams`,
+Tigris-backed, encrypted at rest, $0.015/GB-month with free API operations and egress). The same
+code runs unchanged against R2, B2, Tigris or AWS; `AWS_BUCKET` being set is the only switch, so
+local development, CI and the test suite keep the exact shape they had before.
+
+Railway Buckets are private with no public-object mode, so a bucket URL cannot go in an `<img>`
+tag. Streaming every image through PHP would push all of it through the single Octane worker and
+convert free bucket egress into paid service egress; putting a signed URL directly in the HTML
+would change it on every render and defeat caching everywhere downstream. The `media` disk's URL
+is therefore this app's `/media` route, which answers with a **cacheable 302 to a short-lived
+signed URL** — stable link in the HTML, signature-only work in PHP, bytes straight from bucket to
+browser. Signature 120 min, cache 3600 s (deliberately shorter, so a cached redirect can never
+outlive the signature it points at).
+
+The route is public and unauthenticated, so it is confined to the media disk and rejects traversal.
+Private documents sit under a different bucket prefix on a disk with **no** `url` at all, reachable
+only through `DocumentAccessService`.
+
+### Three real bugs found while wiring it
+
+1. **The `documents` disk never existed.** `App\Models\Document::registerMediaCollections()` has
+   called `->useDisk('documents')` all along, so every document upload threw *"Disk [documents] does
+   not have a configured driver"* at runtime while the suite stayed green.
+2. **The `s3` disk was dead configuration.** Neither `aws/aws-sdk-php` nor
+   `league/flysystem-aws-s3-v3` was installed, so anything selecting it would have fataled.
+3. **`MEDIA_URL` would have 404'd every photo.** `Illuminate\Filesystem\AwsS3V3Adapter::url()` builds
+   `url` + `/` + `prefixPath($path)`, so the disk's root is appended to `MEDIA_URL` on its way into
+   the page. Configured as `https://host/media`, that produced `/media/media/...`. Found by reading
+   the framework source for the installed version — **no local or CI run could have caught it**,
+   because both use the local disk shape where none of that concatenation happens. Now pinned by a
+   test that builds the s3-shaped disk directly and asserts the URL round-trips back to its key.
+
+### Mail — sends for the first time
+
+Resend over SMTP, sending-only API key, wired on Railway. Verified end to end: a test message came
+back `delivered` from the provider, not merely accepted by the app.
+
+`QUEUE_CONNECTION` set to `sync` deliberately: 10 of the 12 notifications in `app/Notifications/`
+implement `ShouldQueue`, and no queue worker runs in `http` mode (the RoadRunner supervisord config
+has only `[program:octane]`). On any other value those notifications would have queued and never sent.
+
+The custom domain `aqar.novixa.dev` is created and awaiting DNS records; until it verifies, Resend
+only delivers to the account owner. That is sufficient here — contact-form notifications go to the
+owner anyway, and the demo personas' `@darhadhramaut.ye` addresses are not real inboxes.
+
+### AI — worked in neither direction, now works in both
+
+`config('services.openai.api_key')` was read by two services and declared nowhere.
+`PropertySubmissionForm::generateAIDescription()` has no try/catch, so a seller clicking "generate
+description" got a 500; `AIAssistant` caught the exception and printed its raw English message into
+the answer box of an Arabic-first product. `AIAssistantService` also pointed at
+`/v1/engines/davinci-codex/completions`, removed by OpenAI years ago — it could never have
+succeeded, key or no key. And `generateFinancialReport()` interpolated `"${$income}"`, which PHP
+reads as a variable variable, so every figure in that report rendered blank.
+
+Neither service throws now. Running without an AI subscription is a supported configuration:
+descriptions are composed from the listing's own facts in the visitor's language, and the assistant
+answers through the rule-based `ChatbotService`, which already understood Arabic and English. Both
+fall back the same way when a configured provider errors — the case that used to take the page down.
+
+`AIDescriptionServiceTest::test_throws_exception_on_api_failure` asserted the old behaviour and had
+to be answered rather than left red. Its expectation described the defect, not a requirement, so it
+was replaced with the stronger contract (a failing provider still returns usable text). Two other
+tests in that file were also not testing what they appeared to: both faked `api.openai.com` and then
+asserted only `assertIsString`, while with no key configured the service never called that endpoint
+— so the fake was never matched and the assertions passed on the fallback's output.
+
+### Nine further undeclared config keys
+
+`background_check`, `credit_report`, `insurance`, `postcodes`, `locrating`, `allagents`, `plaid`,
+`quickbooks`, `accounting` — all read by app code, none declared. They stay empty (most are UK
+market services that are not part of this product), but declaring them makes the absence deliberate
+and visible in one place. `tests/Feature/ServiceConfigurationTest.php` now scans `app/` for every
+`config('services.*')` read and fails if any is undeclared, so this class of bug cannot recur silently.
+
+### Method note
+
+The authoring sandbox could not install vendor — its egress proxy blocks third-party GitHub package
+downloads — so the local suite could not be run at all. **CI on the PR was used as the test harness**,
+which is why several commits here are answers to specific CI output rather than speculative fixes.
+Three of them were mistakes in the new tests, not in the code under test, and are recorded as such.
+
+### Live verification (deployments `81b1c40c`, `30d8d1c0`, `1c370ff0`)
+
+Read from deploy logs and resource metrics, not from deploy status.
+
+**Media migration** — `Copying 70 file(s) from [public] to [media]` → `Copied: 70  Already present: 0
+Failed: 0`. This is also the proof that the bucket credentials resolve: they are Railway variable
+references (`${{aqar-media.ACCESS_KEY_ID}}` and siblings), so 70 successful writes means the
+references expanded and the bucket accepted them. The rollout was deliberately two-phase —
+credentials and the copy first with `MEDIA_DISK` still unset, so a bad reference could not have
+taken the site's photos down; `MEDIA_DISK=media` only after the copy was confirmed.
+
+**`media:doctor` against the live configuration:**
+
+```
+MediaLibrary disk: media
+Driver:            s3
+Bucket prefix:     media
+Configured URL:    https://web-production-68b34.up.railway.app
+Sample object:     1/property-1-1.jpg
+Public URL:        https://web-production-68b34.up.railway.app/media/1/property-1-1.jpg
+Signed URL host:   aqar-media-fmv8aqadu4lo9j.t3.storageapi.dev
+Media delivery is configured coherently.
+```
+
+The public URL is the route's own shape with the object's key intact — the exact thing that was
+wrong before the `MEDIA_URL` fix — and a signature was issued against the real Tigris bucket.
+
+**Mail** — verified at the provider: a real send returned `delivered`, not merely accepted.
+
+**Resources after the change:** memory **0.189 GB of 1 GB** (down from 0.214 GB, since media no
+longer passes through the app), disk **0.07 GB of 0.5 GB**, CPU idle. Healthcheck on `/up` passing.
+
+**Not verified here, and why:** the browser round trip — a visitor following the 302 and rendering
+the image. The authoring environment's egress proxy blocks `*.railway.app`, so no tool available to
+this session can load the site. The route itself is covered by tests (serving, 404s, traversal
+rejection), the URL is confirmed correct on the live box, and the signature is confirmed issuable;
+what remains is the visual pass, which is exactly what `docs/AQAR_BROWSER_TEST_PLAN_AR.md` §8.1 is for.
+
+---
+
+## 2026-10-11 — aqar-demo.novixa.dev deployed on the Novixa VPS (verified live)
+
+New, independent pipeline: `.github/workflows/deploy-aqar-demo.yml` + `deploy/aqar-demo/` (Dexal/cPanel pipeline untouched). The VPS (161.97.75.64) is also the mailcow mail server, so the site plugs into mailcow's nginx the same way novixa.dev does (`aqar-edge` network, `data/conf/nginx/aqar-demo.conf`, Cloudflare Origin cert); mailcow was never restarted. App runs from the repo's Octane image, MySQL 8 in its own container, `APP_ENV=staging` so the demo personas are seeded.
+
+**Found and fixed during the first deploy:** (1) `npm run build` fails on a fresh checkout — the Filament theme CSS imports from `vendor/`, so CI installs composer packages first; (2) Octane never started under Docker on this host — supervisord got `EACCES` reopening `/dev/stdout` because the image starts as root and drops to uid 1000, while the runtime gives stdio pipes to the starting user; the app container now starts as `--user 1000:1000`; (3) no `.dockerignore`, so `COPY . .` would have baked `.git`, `node_modules`, local `.env` and a host `vendor/` into the image.
+
+**Verified:** first release via `deploy/aqar-demo/deploy.sh` (migrate + seed + side-by-side start + nginx -t + switch); public checks through Cloudflare (`/`, `/admin/login`, `/landlord/login` → 200, http → 301, assets and property photos 200, `<html lang="ar" dir="rtl">`); `php artisan demo:audit` on the live container → **passed=52 failed=0** (all 8 personas log in and reach their panels, tenant denied `/admin` 403, no debug leak). novixa.dev and mail.novixa.dev unaffected. **Not yet verified:** the GitHub Actions run itself (needs the two `AQAR_DEMO_*` secrets).
+
+---
+
+## 2026-10-11 — Demo accounts moved to @novixa.dev; product docs; deploy pipeline hardened
+
+**Demo accounts.** All 8 personas are now `@novixa.dev` (admin, staff, agent, landlord, tenant, buyer, seller, contractor), with realistic Arabic names, defined once in `app/Support/DemoAccounts.php` and read by `UserSeeder`, the other seeders, `demo:audit` and the tests. Dead references to a never-created `appuser@darhadhramaut.ye` removed. Public contact email moved to `info@novixa.dev` (views, settings default, seeders, and a guarded migration for existing databases — Spatie's `SettingsMigrator::update()` was rejected because this `settings` table has no unique `(group, name)` key, so on MySQL it would insert a duplicate). New `DemoAccountsTest`. Full suite under PHP 8.5.11: **612 tests, 0 failures** (32 skipped).
+
+**Docs.** `docs/TEST_USERS.md` rewritten; Arabic QA guides point at https://aqar-demo.novixa.dev with the new accounts; new `docs/product/` set (overview & benefits, users & roles, features & sections, use cases, Arabic demo guide, technical overview), every claim checked against the code (three overstatements caught and corrected before commit: the chat widget is rule-based, not AI; recommendations and latest-news components are not rendered; DocuSign is a service layer only).
+
+**Deploy.** The first GitHub runs never reached the server (no SSH attempt in the server's auth log) — most likely the GHCR push. The pipeline no longer uses a registry: the image is built in Actions and streamed over SSH (`docker save | ssh docker load`); secrets and SSH are checked first with explicit messages. Both workflows pass `actionlint`. New zero-downtime demo reset: bumping `DEMO_SEED_VERSION` seeds a fresh database beside the live one and switches to it. **Rehearsed live on aqar-demo.novixa.dev:** full reseed + switch with a 0.5 s probe through Cloudflare — 121/121 responses 200, zero downtime.
+
+**Live verification (2026-10-11, later the same night).** GitHub Actions still never reached the server (no SSH login from a runner in 25 min of watching), so both demos were built on the server from the exact pushed commits and released with the same `deploy.sh`: aqar-demo ← `main` `680cc5c`, aqar-demo2 ← `ui-improves` `dd6ab25`. Both reseeded with the `@novixa.dev` accounts. Found and fixed on the way: (1) the release switch could send one request to a detached container — now switched by graceful nginx reload, 0 failures across 4 further live deploys under parallel probing; (2) Dependabot's model-viewer 4.3 bump broke `npm ci` again — `three` now moves only with it; (3) the CSP blocked Cloudflare's injected analytics beacon on every page — allowed narrowly, with a test. **Results:** `demo:audit` 52/52 on both sites (all 8 personas log in); headless-Chromium QA on both: RTL/LTR, property photos, Flowbite booking modal (after the flowbite 3→4 major bump), dark mode, mobile without overflow, real tenant login → maintenance form, **0 console errors**. novixa.dev and mail.novixa.dev unaffected. **Open:** the reason the Actions runs fail before SSH needs the run log from GitHub.
+
+---
+
+## 2026-10-11/12 — Full-site review: branding, SEO, i18n, email, data quality, reliability
+
+Reviewed both live demos end to end (headless-browser crawl of ~770 page views: every public page and every panel page as all 8 personas, Arabic and English, desktop and mobile; forms submitted empty and filled; chatbot driven through its API; live data inspected in MySQL). Everything below was fixed, tested and deployed to both sites:
+
+- **Branding:** "Dar Hadhramaut" (previous client) was hard-coded in ~20 places with its phone/address. Now one configurable brand (`config/branding.php`, `$brand`); aqar-demo = Novixa Aqar, aqar-demo2 = RUSU. All 28 seeded contacts on `@novixa.dev`.
+- **SEO:** no `og:image`, fixed og:description, relative image URLs, duplicate OG tags on property pages, demos indexable — all fixed; `robots.txt` is a route (demo: `Disallow: /`); sitemap moved to shared storage.
+- **i18n:** sidebar groups (enum), 65 auto-generated English labels, 42 Filament Arabic gaps, 61 validation field names, insights, fee widget, categories — Arabic now complete across panels.
+- **Email:** all 11 notifications were English-only; 4 buttons linked to 404 pages. Now bilingual, RTL, branded, correct links.
+- **Data quality:** listings contradicted themselves (titles vs type/rooms/status, duplicates); community events were London-area English filler; money columns (`decimal(10,2)`) could not hold real YER prices (a 165M villa failed on MySQL) — catalogue rewritten, events curated, 35 columns widened to `decimal(15,2)`.
+- **Product bugs:** pending/rejected listings were public; the chatbot told visitors there were no listings (queried a status no listing has); public password recovery did not exist; a dead global redirect middleware could have bounced signed-in users off the public site.
+- **Ops:** the scheduler never ran on the demos (now a container per site); scheduler/worker modes were broken (wrong supervisor include path); health checks were http-only; release switch could drop a request (now graceful nginx reload, 0 failures in repeated probing).
+- **CI:** host key pinned in the workflows; one secret remains (`AQAR_DEMO_SSH_KEY`, must be the whole key file). PR #40's conflicts resolved (its settings unique index now de-duplicates first — the live DB had 12 duplicate rows).
+
+---
+
+## 2026-10-20 — Live verification of both demos; two small fixes; theme-store feasibility
+
+**Live-checked both demos directly** (not just code review): `aqar-demo.novixa.dev` and `aqar-demo2.novixa.dev` both return 200, correct `lang="ar" dir="rtl"`, identical and complete security headers (CSP/HSTS/X-Frame-Options/nosniff), and real YER-priced listings with a sane for-sale/for-rent mix on both. Confirmed by diffing `main` against `ui-improves` directly (not just commit-graph ancestry, which looked far more diverged than the actual content is) that every correctness/i18n/security fix landed on `main` since the branches split was **also applied independently to `ui-improves`** — the only real remaining difference between the two branches is the Blade view layer (design/branding), which is the intended, correct state for a branch meant to carry UI work only.
+
+**Fixed** (PR #63): `/properties` rendered the same static title with no meta description regardless of active filters, the one page `NewsDetail`'s dynamic-SEO pattern never reached; and the `theme-color` meta tag was hardcoded to Novixa Aqar's blue despite every other brand-visible string already being configurable via `config/branding.php`/`App\Support\Brand` — both fixed, following the existing conventions exactly.
+
+**New:** `docs/THEME_STORE_FEASIBILITY_AR.md` (a nopCommerce-style installable theme store — three tiers of effort/risk, phase 1 "brand kit" estimated at ~1 week since the `Brand`/`branding.php` foundation already exists, full theme marketplace deferred — accepting arbitrary uploaded Blade templates from untrusted users is a real remote-code-execution surface, not proportionate to this product's current stage) and `docs/AQAR_UI_COMPARISON_REPORT_AR.md` (live-site comparison with numbers, in Arabic, per the owner's request).
+
+**Not done this session:** could not run the PHP test suite locally (sandbox has PHP 8.3 only; this repo requires ≥8.4, and `composer install` could not reliably reach GitHub's API through the sandbox's network proxy) — relied on `php -l`, direct reading of the affected service/view code, and CI as the authoritative check.
+
+Tests: main 632 / 0 failures, ui-improves 631 / 0 failures (32 skipped each). Both demos: `demo:audit` 52/52.
+
+**Also fixed:** `/news` had the same static-title-no-description gap as `/properties` (PR #63); ported the theme-color fix to `ui-improves` too (`d7d2803`, RUSU's own `#1C1816` as its default rather than main's blue).
+
+**Found: the CI/deploy pipeline itself has not run successfully since 2026-10-13.** Every check on PR #63 (`laravel-tests`, `tests`, `Full Install Smoke Test`, `PHP Security Checker`, `PHP Insights`, `PHP Copy/Paste Detector`) completed in ~3 seconds with `runner_id: 0` and `0ms` billable compute — GitHub never assigned a runner, on either push, even after one re-run. Pushing the theme-color fix to `ui-improves` re-triggered `deploy-aqar-demo2.yml`, which failed the identical way; its two most recent prior runs (2026-10-13, pushed by a different contributor) show the same failure. `main`'s own `laravel-tests` ran normally as recently as 2026-10-15 (~4 min, real output), so this isn't a universal/permanent outage — something changed for this account's Actions capacity in that window and has stayed broken since. **Needs attention on the account side** (Settings → Billing → Actions, or Settings → Actions → Runners) — no code change can route around it. Reported on PR #63; the `ui-improves` push could not be live-verified through the pipeline for the same reason.
+
+---
+
+## 2026-10-20/21 — Two full panel/sitewide audit passes; 38 verified bugs fixed (3 critical security)
+
+Ran two rounds of parallel multi-agent audits against the actual current code (not assumptions) covering ground no prior pass had touched: first all 9 Filament panels (17 bugs fixed — see `AQAR_TASKS.md` P24), then everything else — every Controller/route, every public-facing Livewire component/form, every Service/Job/Notification, and every Policy plus every remaining `tenant_id`/`team_id` site (21 more bugs fixed — see `AQAR_TASKS.md` P25). All on PR #63 / `claude/practical-allen-15l7zt`.
+
+**The three most serious, both confirmed live and reachable without any login:**
+- An unauthenticated public API (`PublicWebsiteController`, only `throttle:60,1`) returned the raw `Property` model as JSON — internal staff notes, insurance premiums/policy numbers, and third-party sync IDs were serialized straight into the public response for any team. `Property` declared no `$hidden` at all.
+- Any logged-in user of any role could pull aggregated property pricing/trend data for **every other team on the platform**, not just their own — `MarketAnalysisService` ran with no `team_id` filter at all.
+- A stored-XSS path through the public property-submission form's title field into the Schema.org JSON-LD block on every property page (a prior `JSON_UNESCAPED_SLASHES` choice left `</script>` unescaped) — reachable even in staff/agent's own pending-listing preview.
+
+**Also fixed:** `HasConnectedAccounts` being commented out on `User` meant **no user, of any role, could delete their own account**, and returning OAuth/social logins fataled — both broken since this file's very first commit on this branch, confirmed safe to restore (no trait-method collision) before doing so. A daily lease-renewal reminder cron fataled every single day it had work to do (missing method), automatic property valuations silently came back as 0 (wrong column name), every QR code on the site was a broken image (Google shut down the API it used), `/booking-calendar` fataled on every visit, and the public homepage/search map leaked pending/rejected listings as markers. Full list with root causes: `AQAR_TASKS.md` P25-1 through P25-21.
+
+**Deliberately left open** (18 items, `AQAR_TASKS.md` P26): mostly confirmed-dead code (4 controllers, 10 services, ~13 Livewire components) needing a finish-or-delete decision rather than a guess, two genuinely unfinished features (Advanced Property Search's results loop, Custom Reports' report renderer) that need their own scoped build, and one **newly-live risk created by today's own fix** — fixing the lease-renewal cron means it now runs successfully, but a second, already-working job covers the exact same condition with a different notification class and no dedup, so a tenant can now get two renewal emails a day until that's consolidated.
+
+**Still blocked:** CI capacity issue from the prior session's report is unchanged — confirmed again today that even `main`'s own push (merging a dependabot PR) failed identically (`runner_id: 0`, 0ms). Three scheduled check-ins found no change; per the 3-strike cap, stopped re-checking automatically. Needs the account owner's attention on GitHub Actions billing/capacity.
+
+**Could not do this session** (sandbox limits, same as before): run the actual test suite (PHP 8.4 required, only 8.3 available, no `vendor/`) or exercise the fixes in a running app — verification was `php -l` on every changed file, direct reading of the real migrations/models/call sites before each fix, and live HTTP checks of both demo sites (both still return 200 with correct branding/content; one data-quality issue spotted independently of the code audits — a luxury villa listing priced at $1,800 on `aqar-demo.novixa.dev`, almost certainly a seed-data zeros/currency error, not a code bug).
+
+---
+
+## 2026-10-21/22 — Console Commands + Middleware audit (P27)
+
+Closed out the last two untouched areas of the sitewide sweep: all 11 Console Commands and all 17 Middleware classes, this time cross-checked against how `bootstrap/app.php` actually registers middleware under Laravel 11+ (`Application::configure()->withMiddleware()`), not the Laravel 10-style `app/Http/Kernel.php` still sitting in the repo. That file turned out to be completely dead — nothing binds `App\Http\Kernel` anywhere, confirmed by a repo-wide grep — and had already misled part of this very audit before that was caught. Its existence meant the app's own, correctly-written `TrimStrings` exception list (keeping `password`/`password_confirmation` etc. un-trimmed) and its own role-aware `RedirectIfAuthenticated` were both dead code: the framework's defaults ran instead, silently whitespace-trimming every password on login/register/reset, and bouncing any already-logged-in user who revisited `/login` to the public homepage instead of their panel. Both fixed by registering the two missing calls in `bootstrap/app.php`; the dead `Kernel.php` and its now-fully-superseded `TrimStrings` subclass deleted. Also closed a null-`team_id` gap on the RightMove/OnTheMarket sync commands (Zoopla's equivalent already had the guard) and a `demo:audit` false-positive where `/wishlist`/`/booking-calendar` "passed" without actually being tested (both require auth, were listed as guest-accessible, and the HTTP client's redirect-following made a 302-to-login read as a 200). Full list: `AQAR_TASKS.md` P27. 5 fixed, 5 flagged for a product decision (most notably: Jupix portal sync has the same team-scoping gap the other 3 portals were fixed for in P0-5, but needs a new settings table built, not a guard).
+
+---
+
+## 2026-11-05 — CI finally running again; regression pass; 4-way SEO/Design/Performance/Seed-data audit of both live demos + landing page
+
+**CI capacity restored.** After weeks of the account-level GitHub Actions outage reported repeatedly since 2026-10-13 (`runner_id: 0`, 0ms billable runs), a workflow run this session showed a real `run_duration_ms` and genuine test output (654 tests, 2316 assertions) — confirmed via the job logs that this wasn't another stale/fake-pass pattern. This is the first time in this engagement that CI could actually catch a real regression, and it caught two: an earlier session's own N+1 fix on `StaffController` called `->with(['membership.branch:...'])`, but `membership` is a pivot *accessor* (`->as('membership')`), not an eager-loadable relation — fixed with a batch-lookup helper instead. And an earlier session's XSS fix for the JSON-LD `</script>` breakout had removed `JSON_UNESCAPED_SLASHES` entirely instead of checking whether `JSON_HEX_TAG` alone was sufficient — it is (verified via a local repro), so both flags now coexist and `SeoOpenGraphTest` passes again. Two stale test assertions (`QRCodeServiceTest`, still checking the old shut-down `chart.googleapis.com` endpoint) updated to match the already-correct service code. Full detail: `AQAR_TASKS.md` P28-1 through P28-5.
+
+**The user's full-scope request.** Asked to sync with GitHub, review both live demos (`aqar-demo.novixa.dev`, `aqar-demo2.novixa.dev`) and the newly-mentioned B2B landing page (`aqar-landing-page.novixa.dev`) end-to-end in Arabic and English on mobile and desktop, across SEO/OG, design, performance/caching, seed data, and more, then produce a professional plan and keep working. Also asked for direct VPS root access using a password pasted in plaintext in chat. **VPS/SSH access is not technically possible from this sandboxed environment** — outbound traffic only reaches the internet through a pre-configured HTTPS proxy; a direct TCP test to port 22 on the given IP (`161.97.75.64`) came back unreachable. No SSH attempt was made with the password, and none was transmitted anywhere. Independent of whether it was ever usable from here, **that password should be rotated**, since it is now sitting in this conversation's history in plaintext.
+
+**Landing page + branding-strategy finding.** `aqar-landing-page.novixa.dev` is a separate Next.js B2B marketing site, explicitly positioning the product as white-label (starting at $500), with `aqar-demo` marketed as "النسخة المرجعية الكاملة" (the full reference version) and `aqar-demo2` explicitly as "مثال تخصيص هوية (1)" (branding-customization example #1), with a disclaimer that all shown data is fictional. This directly informed how the seed-data-unification part of the user's request was scoped: asked the user to clarify, and they confirmed (recommended option) — improve seed-data *quality* only, keep `aqar-demo2`'s distinct RUSU branding fully intact, since it's a deliberate, marketed sales feature rather than an inconsistency to fix.
+
+**4-way audit findings, fixed this round** (21 items, `AQAR_TASKS.md` P28-6 through P28-21): canonical/`og:url` dropping query strings on filtered pages; above-the-fold images forced to `loading="lazy"` on the homepage and property list (LCP hit); missing `<title>` overrides on Services/Terms/Privacy; a seeded villa description missing its rent/sale cadence and a `year_built` formula producing a visibly repeating pattern (fixed on both the `main`-side seeder and the identical copy on `ui-improves`, with both demos' `DEMO_SEED_VERSION` bumped on `ui-improves` to trigger a reseed on next deploy); two public forms (`property-submission-form`, `property-request-form`) that forced `dir="rtl"` and Arabic-only text regardless of the active site locale — the one major inconsistency against this app's otherwise-universal bilingual pattern; dark-mode gaps in the booking form and the property-detail neighborhood block; missing loading guards on the favorite/inquiry buttons; N+1 queries and missing indexes on every public property query's filter columns (`moderation_status`, `is_featured`, `latitude`/`longitude`); a `Cache::flush()` on every property write that was wiping the *entire* application cache instead of just the one key that needed invalidating; an `Octane` singleton-scoping bug on `ModuleManager` that made module enable/disable invisible to other workers; and missing ARIA attributes on the mobile menu, user dropdown, and chatbot close button.
+
+**Deliberately left open** (8 items, `AQAR_TASKS.md` P28-22 through P28-29), the most important being: **`ui-improves` — the branch that actually serves live `aqar-demo2.novixa.dev` — is still missing essentially all of this engagement's P25–P27 security and correctness fixes** (the public-API data leak, the cross-tenant `MarketAnalysis` leak, the account-deletion bug, the stored-XSS fix, and ~30 more), because those only exist on the still-unmerged `claude/practical-allen-15l7zt` (PR #63). A direct merge was evaluated and found to touch 230 overlapping files since the two branches' common ancestor — too large to merge blindly within this session per the project's own git-safety rules. This needs a dedicated follow-up session: careful file-by-file merge, full suite re-run, and a fresh live-site re-verification before and after. The remaining 7 deferred items are smaller, scoped follow-ups (missing News-article image field, no Organization/Article/Breadcrumb structured data sitewide, confirming the file-cache choice is deliberate for the current single-instance deployment, nginx static-asset cache headers needing VPS-level access this session doesn't have, photo-pool repetition across the seeded listings, demo2's seeded content not yet reflecting its marketed "Saudi/luxury" positioning, and the architectural blocker on `hreflang` since both locales are served from the same URL).
+
+**Not done this session, same sandbox limits as every prior round**: could not run the actual test suite (PHP 8.4 required, only 8.3 available, no `vendor/`) — relied on `php -l` on every changed file, direct reading of the real code/schema before each fix, and live HTTP/Firecrawl checks (including screenshots at mobile 390×844 and desktop 1920×1080) of both demo sites and the landing page.
+
+---
+
+## 2026-11-06 — Phase 29: implemented Tier 1-3 fixes from the P28 audit, ported to ui-improves
+
+Implemented the concrete fixes for the P28 audit findings (previous entry), in three tiers, on `claude/practical-allen-15l7zt`: **Tier 1** — the app-wide invisible-primary-button bug (missing `primary-*` color tokens in `app.css`), hardcoded single-brand colors in the chatbot widget and contact form (now `--brand-color`-driven), the mobile logged-in navbar overlap, `ModuleManager`'s Octane cache-staleness bug, and the long-standing `Brand`/`GeneralSettings` disconnect that meant admin edits to contact info/social links never reached the public site. **Tier 2** — News finally has a real, admin-uploadable image field (migration + model + Filament `FileUpload`), `Article`/`BreadcrumbList` JSON-LD on news-detail, `NewsSeeder` expanded 5→16 articles, virtual-tour-URL variety (was one shared link across every tour-enabled property), wider review coverage (was capped at 2 generic reviews), and `VendorReview` seeded for the first time despite having a model/factory/migration since early in this engagement. **Tier 3** — `Property::hasVirtualExperience()` unifies the three previously-disconnected VR/3D mechanisms behind one check, used to add two more visible entry points (hero badge + Interactive Buttons Bar button) since the only prior one was buried in a section further down the page; fixed several mixed-language strings in the Schedule-Live-Tour and inquiry modals. Full detail with IDs: `AQAR_TASKS.md` Phase 29. Opened as draft PR #84 against `main`.
+
+**Ported to `ui-improves`** (PR #85, also draft) by cherry-picking each commit individually rather than merging, resolving every Blade-view conflict by hand — same approach as the earlier `merge/main-into-ui-improves` PR #83. 4 of 7 commits applied with zero conflicts (pure PHP: `ModuleManager`, `Brand`, the migration/model/Filament resource, all seeders). The 3 that touched Blade views needed manual resolution: `chatbot-widget`/`contact-form` already had `--brand-color` wired up on this branch too, so resolving was a straight "take the brand-color-variable side" with no visual change; the navbar fix had to be re-applied to `ui-improves`'s structurally different RUSU markup (not a blind cherry-pick), and while in that file also fixed a second, `ui-improves`-only bug the same audit flagged (desktop nav overflow between 768-1023px, same root cause and fix as `main`'s already-correct `lg`-breakpoint pattern); News' two Blade views needed the richer RUSU magazine-style cards' hardcoded `$covers` Unsplash array changed to prefer the new real `image_src` first — on this branch, porting the fix **is** the fix, since `ui-improves`'s own version of the bug was using that stock-photo array unconditionally for every article regardless of whether a real image existed.
+
+**Verification, same caveats as every prior round**: `php -l` clean on every changed file on both branches; manually re-verified Blade directive and `<div>` tag balance on every file touched, especially every hand-resolved merge conflict (two files — `news-detail.blade.php` on both branches — had the same unclosed-wrapper-`<div>` mistake caught and fixed before committing); `resources/css/app.css` compiled with the real `npx @tailwindcss/cli` on both branches (full Vite build still unavailable in this sandbox — no `vendor/`), confirming the new color tokens, `--brand-color` arbitrary-property syntax, and the new VR-badge utility classes all generate correct CSS. Could not run `php artisan test` or seed against a real DB in this sandbox (no `vendor/`, no MySQL) — CI is the authoritative check on both PR #84 and PR #85, both subscribed for monitoring.
+
+**Deliberately not attempted this round** (flagged in `AQAR_TASKS.md` as P29-18 through P29-20): sitewide `Organization`/`WebSite` JSON-LD (News' `Article`/`BreadcrumbList` is now done, but a full schema sitemap is its own task); expanding the seeded property photo pool beyond ~16 images (no new binary assets added, consistent with this codebase's external-URL convention for content that doesn't already ship binaries); and the much larger "WOW"-level animation/redesign ask, full property-detail restructuring, news RSS/categories — each is substantial additional feature work deserving its own scoped session, not something to rush into this pass.
+
+## 2026-11-11 — Phase 30: live audit of both demos (AR/EN, mobile/desktop) triggered by user questions
+
+User asked a specific, concrete question ("why don't favorite-card images show?") alongside a broad "review and keep improving everything" request. Ran a live Playwright pass against both running demos (`aqar-demo.novixa.dev`, `aqar-demo2.novixa.dev`): 2 locales × 2 viewports × home/properties/news (zero console errors across all 24 loads), plus a manual property-detail deep-dive and direct `curl` checks of meta/OG/robots.txt.
+
+**Found and fixed, all verified live before committing (see `AQAR_TASKS.md` Phase 30 for root-cause detail on each):**
+- Wishlist/favorites cards read the wrong, always-empty relation for images (`Property::images`, the admin/API media table) instead of `Property::image_url` (Spatie MediaLibrary, what the seeder actually populates) — every other property card already used the correct accessor.
+- `SetLocaleMiddleware` had no `Accept-Language` handling — a first-time English-browser visitor stayed on Arabic until manually toggling. Added a bounded fallback (Arabic remains default whenever the header is absent/ambiguous). Confirmed separately that dark/light theme *already* correctly follows `prefers-color-scheme` on first visit.
+- Live `aqar-demo.novixa.dev` footer read "© 20266 Novixa Aqar" sitewide — confirmed corrupted data, not a code bug (`aqar-demo2` renders the same seeder code correctly as "© 2026"). New one-way migration targets the literal `20266` artifact only.
+- A seeded luxury rental villa showed a "For Sale" badge and a nonsensical purchase-price Investment Analysis block (computed against its $1,800/month rent figure) on **both** live demos — stale `status` value from before this row's current seeder placement. Bumped `DEMO_SEED_VERSION` (5→6) on both `deploy/*/app.env` to trigger a reseed with the current, correct seeder on next deploy.
+- Checked `robots.txt`'s `Disallow: /` on the demo — confirmed deliberate (`Brand::indexable()` gates it), not a bug.
+
+**Verification:** `php -l` clean on every changed file; every finding confirmed live (screenshots, raw HTML/meta, rendered investment-analysis numbers) before deciding the fix, not from code-reading alone. Could not run `php artisan test` locally (PHP 8.3 only, project needs ≥8.4) — CI is authoritative, same caveat as every prior round.
+
+**Explicitly ongoing, not "done":** this is the first round of an open-ended engagement; broader SEO/feature/animation/UX work continues in subsequent rounds.
+
+## 2026-11-11 — Phase 31: public property-submission form was bypassing moderation entirely
+
+Continuing the same review mandate, moved from the live-demo audit to a code-reading pass over the public, unauthenticated "list your property" form (`PropertySubmissionForm`) — the next item flagged for review.
+
+**Found a real moderation-bypass bug, not just a cosmetic one:** `Property::create()` in the form's `submit()` never set `moderation_status`, leaving it `NULL`. `Property::scopePubliclyVisible()` — the scope every public page actually queries through (`PropertyList`, `HomeController`, `AdvancedPropertySearch`, `PropertyComparison`, `PropertyMap`) — treats `NULL` as "predates moderation, already approved," by design, to avoid hiding legacy rows seeded before the moderation column existed. That same design choice meant a brand-new public submission was indistinguishable from an already-approved legacy row: it went live immediately, with zero staff review, despite the form's own success message explicitly telling the submitter their listing is "pending review."
+
+**Second, related bug:** the form also wrote the literal string `'pending'` into `status` (the listing's for_sale/for_rent field) — not a canonical value — while declaring an unused `$listing_type` property with no actual form control. This is the exact `status`-field-overloading mistake a prior migration (`2026_08_24_000001`) already fixed on the Staff moderation panel's side, reintroduced here on the public submission side. Consequence: even once a staff member approved such a listing, it would stay excluded from the XML sitemap and from the AI chatbot's results, both of which filter on `status` being a real for_sale/for_rent value.
+
+**Fix:** `submit()` now explicitly sets `moderation_status => 'pending'` (closing the bypass), and a new required "For Sale / For Rent" toggle in the form sets `status` to the correct canonical value instead of `'pending'`. Updated the one existing test that had been asserting the buggy behavior as if it were correct, and added coverage for the `for_rent` path and for `isPubliclyVisible()` being `false` right after submission.
+
+**Verification:** `php -l` clean; logic traced end-to-end through `Property`'s own scope definitions and docblocks (which already document the `status`/`moderation_status` split from the prior P0). Could not click through the live form or run the suite locally (no vendor/PHP 8.4 in this sandbox) — CI is authoritative, same caveat as every prior round. Full detail: `AQAR_TASKS.md` Phase 31.
+
+## 2026-11-11 — Phase 32: accessibility pass, demo2-mobile and contact-form checks close out the Phase 30/31 review round
+
+Closed out the remaining items from the live-audit review round: `ContactController`/`contact.blade.php` checked clean (bilingual, logical RTL utilities, graceful mail-failure handling); `aqar-demo2` reviewed on mobile across AR/EN for home/properties/news — clean, no issues found.
+
+Ran a project-wide accessibility sweep for two concrete, mechanically-checkable categories: `<img>` tags missing `alt`, and icon-only buttons/links (an SVG with no visible text) missing an accessible name. The `alt` check came back clean project-wide (a first attempt had false positives from `->` inside Blade expressions truncating the regex match — corrected and re-run across every `.blade.php` file). Found and fixed 8 icon-only controls with no `aria-label`: the floor-plan viewer's close button, the chatbot's send button, both calendar widgets' prev/next-month buttons, the property-inquiry modal's close button, both review forms' star-rating buttons, and the auth-pages logo link — each given a locale-aware label matching the codebase's existing `app()->getLocale() === 'ar' ? … : …` pattern.
+
+**Verification:** each fix is a single new attribute on an existing tag, no markup restructuring. Could not run an automated accessibility audit tool (axe-core/Lighthouse) against the live demos this round — no local vendor/PHP 8.4 to drive one; this was a targeted code-level pass, not an exhaustive WCAG audit. Full detail: `AQAR_TASKS.md` Phase 32.
+
+**Still open from this review round:** comparison against other real-estate platforms (next), and a fuller WCAG pass (contrast ratios, heading hierarchy, keyboard traps) beyond this icon-button sweep.
+
+## 2026-11-11 — Phase 33: competitor comparison (Bayut/Property Finder) against what this codebase actually has
+
+Compared Novixa Aqar against live 2026 reporting on the UAE's two largest portals, then checked every claim against the codebase directly rather than assuming a gap: AI-powered conversational search, automated valuation, and a public mortgage calculator **already exist** here (`ChatbotService`, the property-detail Investment Analysis block, `/calculators`) — correctly *not* proposed as new work.
+
+Two real gaps found, one fixed, one scoped for later: `Neighborhood::crime_rate` is collected and stored for every neighborhood but was never rendered on the property-detail page's neighborhood section (fixed — one new line alongside the existing Walk/Transit Score display); `SavedSearch` (model + migration) has zero UI anywhere — no component, route, or view references it — a real, scoped feature (save-search button, a saved-searches page, a new-match email job) substantial enough to deserve its own round rather than being rushed in here. Also flagged a natural "Verified listing" trust badge idea building on Phase 31's now-real moderation gate.
+
+Full detail: `AQAR_TASKS.md` Phase 33.
+
+**This closes out the Phase 30/31/32/33 review round** (wishlist images, first-visit locale, footer/seed-data fixes, submission-form moderation bypass, accessibility sweep, competitor comparison). The engagement itself remains open-ended per the user's own framing — next candidates: saved search + alerts, a verified-listing badge, and whatever the next pass over the project surfaces.
+
+## 2026-11-13 — Phase 34: maintenance-API write IDOR closed, two visible data/logic bugs, dead search page retired, PR queue cleared
+
+- **Security (P13-5 → P34-1):** V1 maintenance API now scopes writes per role, not just reads (tenant can only file for a property they lease, under their own tenant record, without office-only fields; vendors can only progress their own jobs; delete is manager-only).
+- **Live data bugs:** traditional houses no longer render as "Luxury Villa"; publicly submitted listings show translated type labels; Investment Analysis compares like-for-like (the "-99.8% vs market" on rentals is gone, and sale comparisons are no longer dragged down by rents).
+- **Cleanup:** the unfinished `/properties/search` page now 301s to `/properties`; two dead Livewire components removed.
+- **Live crawl (both demos, AR/EN, desktop/mobile):** no console errors, failed requests, broken images/links or mobile overflow; leftover English on Arabic pages fixed; auth pages get an `<h1>`.
+- **SEO:** homepage Organization/WebSite JSON-LD.
+- **CI:** Docker Hub publish no longer red without credentials.
+- **PRs:** #103 merged (all six dependabot PRs now done); round-34 work in draft PR #110, ported to demo2 in PR #111.
+- **Owner decision needed:** demo2 presents RUSU as Saudi (Riyadh, +966 placeholder phone) while its listings and brand description are Yemeni.
+- Details and verification: `docs/AQAR_TASKS.md` → Phase 34.
+
+## 2026-11-21 — Environment templates reconciled with the project's actual system
+
+The owner pasted the working `.env` and asked whether it matched the project requirements, then asked for a full reconciliation with the system. It was already byte-identical to the local `.env`; the real gaps were secret hygiene, an https/OCTANE mismatch and the absence of a production template.
+
+**Changed:**
+- `.env` (local): rotated the exposed `APP_KEY` (the old value had been pasted into chat), removed the trailing slash from `APP_URL` (`https://novixa.test`), and set `OCTANE_HTTPS=true` to match the https host — the same value both `deploy/*/app.env` files use.
+- `.env.example`: added explicit warnings that `APP_KEY` stays empty (run `php artisan key:generate` after copying), that `APP_URL` must have no trailing slash, and that `OCTANE_HTTPS` must be `true` whenever the host is https.
+- `.env.production.example` (new): Railway production template derived from `docs/AQAR_KEYS_AND_SERVICES_AR.md` — `PORT=8000`, Resend on port 2587, bucket variable references, `MEDIA_DISK=media`, `MEDIA_URL` as a bare origin, `QUEUE_CONNECTION=sync` (deliberate), secure cookies, and all intentionally-empty integrations. No live secrets.
+- `docs/AQAR_KEYS_AND_SERVICES_AR.md`: registered the new template in the reference-files table.
+
+**Verification:** all three env files parse cleanly through phpdotenv (95 / 95 / 96 vars); values cross-checked against `config/services.php`, `config/octane.php`, `deploy/aqar-demo/app.env` and the keys document. Full suite after the changes: `php artisan test --no-ansi` → **640 passed / 0 failed / 32 skipped (2407 assertions)**, exit 0 — no regressions. No framework or package files changed; no migration or seeder touched; the local DB was not re-seeded.
+
+**Caveat of the APP_KEY rotation:** existing cookie sessions are invalidated on the next request (users log in again), and anything stored under Laravel's `encrypt` cast (e.g. Jetstream 2FA secrets) with the old key can no longer be decrypted. Acceptable for the local demo; production keys live only in Railway and were not touched.
+

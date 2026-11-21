@@ -1,0 +1,57 @@
+/vendor/
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Laravel 4 specific
+bootstrap/compiled.php
+app/storage/
+
+# Laravel 5 & Lumen specific
+public/storage
+public/hot
+
+# Laravel 5 & Lumen specific with changed public path
+public_html/storage
+public_html/hot
+
+storage/*.key
+.env
+.env.testing
+error_log
+.idea/
+Homestead.yaml
+Homestead.json
+/.vagrant
+.phpunit.result.cache
+.phpunit.cache
+rr
+.rr.yaml
+_ide_helper.php
+_ide_helper_models.php
+.phpstorm.meta.php
+public/sitemap.xml
+
+# Media library runtime artifacts (generated conversions/temp uploads)
+storage/media-library/
+
+# Editor / OS cruft
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Claude Code local tooling (skills, local settings, worktree/lock state) —
+# reproducible via the two documented install commands, not app source.
+# CLAUDE.md itself stays tracked; it lives at the repo root, not in here.
+.claude/
+
+# Test coverage artifacts
+coverage.xml
+
+# Stray backup/scratch files
+*.bak
+*.orig
+/scratch/
+
+# Served by routes (routes/web.php); a static copy here would shadow them.
+/public/robots.txt
